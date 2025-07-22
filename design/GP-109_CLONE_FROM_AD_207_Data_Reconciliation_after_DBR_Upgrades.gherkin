@@ -1,0 +1,80 @@
+Feature: Validate Product Plant Data Consistency Across Versions
+
+  The Databricks PySpark script shall compare each column's values by name from product_plant and product_plant_v2 tables, row by row, using specified join keys. It must generate a validation column per compared column indicating "Match" or "Mismatch" based on value comparison. The result must be saved as pp_validation_results with column order: [product_plant.columnX, product_plant_v2.columnX, columnX_validation]. The output table must be dropped and recreated each execution.
+
+  Background:
+    Given the schemas, data types, and join keys for product_plant and product_plant_v2 are known
+    And both tables exist and are accessible in the source schema
+    And the pp_validation_results table is dropped if exists prior to script run
+
+  Scenario: Compare and validate all matching columns between tables (happy path)
+    Given product_plant has columns: id (INT), name (STRING), qty (INT)
+    And product_plant_v2 has columns: id (INT), name (STRING), qty (INT)
+    And the join key is id
+    When the script runs
+    Then for each row present in both tables:
+      | product_plant.id | product_plant_v2.id | id_validation | product_plant.name | product_plant_v2.name | name_validation | product_plant.qty | product_plant_v2.qty | qty_validation |
+    And for each compared column:
+      | Validation Rule         | Error Condition                     | Error Message                   |
+      | Values are equal        | Values differ                       | "Mismatch"                      |
+      | Both values are NULL    |                                     | "Match"                         |
+      | One value is NULL       | One is NULL, other is not           | "Mismatch"                      |
+      | All above               | None of the above                   | "Match"/"Mismatch" accordingly  |
+
+  Scenario Outline: Compare specific column values for Match/Mismatch including NULLs
+    Given product_plant column <column> has value <pp_value>
+    And product_plant_v2 column <column> has value <ppv2_value>
+    When the script compares the values
+    Then the <column>_validation column is <result>
+    Examples:
+      | column | pp_value | ppv2_value | result    |
+      | name   | "Bolt"   | "Bolt"     | "Match"   |
+      | name   | "Bolt"   | "BOLT"     | "Mismatch"|
+      | qty    | 10       | 10         | "Match"   |
+      | qty    | 10       | 8          | "Mismatch"|
+      | name   | NULL     | NULL       | "Match"   |
+      | name   | NULL     | "Bolt"     | "Mismatch"|
+      | qty    | 5        | NULL       | "Mismatch"|
+
+  Scenario Outline: Handle columns present in one table but missing in the other (error case)
+    Given product_plant column <column> is missing in product_plant_v2
+    Or product_plant_v2 column <column> is missing in product_plant
+    When the script processes columns
+    Then the output only contains validation columns for columns present in both tables
+
+    Examples:
+      | column    |
+      | location  |
+      | price     |
+
+  Scenario: Structure/order of validation output table
+    Given columns to be validated are [name, qty]
+    When the script generates the pp_validation_results table
+    Then the columns in the output must be ordered as:
+      | product_plant.name | product_plant_v2.name | name_validation | product_plant.qty | product_plant_v2.qty | qty_validation |
+
+  Scenario: Case and datatype sensitivity in value comparison
+    Given both columns are STRING type
+    When comparing product_plant.name "bolt" with product_plant_v2.name "Bolt"
+    Then name_validation is "Mismatch" (case-sensitive)
+    And "10" (string) vs 10 (int) is "Mismatch" (type-sensitive)
+
+  Scenario: Join rows by primary/business key for row-by-row comparison
+    Given join key is id
+    When id exists in one table but not in the other
+    Then row is excluded from output
+
+  Scenario: Table recreation each run
+    Given pp_validation_results exists before script run
+    When script starts
+    Then pp_validation_results is dropped and newly created per the output specification
+
+  Scenario Outline: Error handling for schema mismatches or missing join keys
+    Given required join key <join_key> is missing in <table>
+    When script runs
+    Then script fails with message "Join key <join_key> missing in <table>"
+
+    Examples:
+      | join_key | table             |
+      | id       | product_plant     |
+      | id       | product_plant_v2  |
