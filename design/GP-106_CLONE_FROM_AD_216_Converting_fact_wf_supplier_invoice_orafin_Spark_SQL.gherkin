@@ -1,141 +1,224 @@
-Feature: Convert Spark SQL notebook to PySpark with functions and variables fidelity
+Feature: Convert Spark SQL code in fact_wf_supplier_invoice_orafin.ipynb to equivalent PySpark code with function conversion
 
-  As a data engineer, I need to convert the provided Spark.SQL() code and all supporting logic in "fact_wf_supplier_invoice_orafin.ipynb" to idiomatic PySpark, including implementing or mapping all referenced reusable functions and constants, and ensuring that variable, function, parameter, and output handling is preserved according to the notebook's requirements and business logic.
+  As a data engineer
+  I want to convert all Spark SQL logic and referenced functions in the notebook to PySpark DataFrame and function code
+  So that all data processing is performed natively in PySpark and remains functionally equivalent
 
   Background:
-    Given the full content of the "fact_wf_supplier_invoice_orafin.ipynb" notebook is available
-    And the complete source code of all referenced reusable functions in DA_CCG_RSD_EU/ReusableFunctions is provided
-    And the complete definition of all constants in DA_CCG_RSD_EU/Constants is provided
-    And all required table and Unity Catalog/variable values (raw_unity_catalog, raw_unity_catalog_hist, edp_lkp_unity_catalog, dims_unity_catalog, config_unity_catalog, cl_control_table, etc.) are accessible
-    And the functional requirements and output contract (output DataFrame/table/view, write mode, locations, formats, partitioning) are fully specified
+    Given the notebook "fact_wf_supplier_invoice_orafin.ipynb" is available
+    And the following modules are referenced in the notebook:
+      | Module                       |
+      | ../DA_CCG_RSD_EU/Constants   |
+      | ../DA_CCG_RSD_EU/ReusableFunctions |
+    And the following variables and widgets are set from context:
+      | Variable                         | Example Value                      |
+      | target_table_path                | "<dbfs path>"                      |
+      | partition_key                    | "<partition_column>"               |
+      | table_format                     | "delta"                            |
+      | compression                      | "snappy"                           |
+      | table_name                       | "fact_wf_supplier_invoice_orafin"  |
+      | unity_catalog                    | "finance_prod"                     |
+      | environment                      | "prod"                             |
+      | project                          | "DA_CCG_RSD_EU"                    |
+      | load_type                        | "full"                             |
+      | view_unity_catalog_name          | "vw_fact_wf_supplier_invoice_orafin" |
+      | raw_unity_catalog                | "finance_prod_raw"                 |
+      | raw_unity_catalog_hist           | "finance_prod_raw_hist"            |
+      | config_unity_catalog             | "finance_config"                   |
+      | edp_lkp_unity_catalog            | "edp_lkp_prod"                     |
+      | dims_unity_catalog               | "dims_prod"                        |
+    And the variable 'cl_control_table' is defined in the Constants module
+    And the following functions must be converted to PySpark:
+      | Function                     |
+      | read_control_table           |
+      | get_basejob_url              |
 
-  Scenario: Successful conversion of notebook to PySpark with function mapping (happy path)
-    Given all variable widgets (target_table_path, partition_key, table_format, compression, table_name, unity_catalog, etc.) have proper values and types as string
-    And required functions like "read_control_table" and "get_basejob_url" are available as PySpark functions
-    And referenced tables and views exist in the specified Unity Catalogs
-    When the Spark SQL code block is translated to equivalent PySpark DataFrame transformations using PySpark API (e.g., DataFrame.withColumn, join, filter, select, Window functions, etc.)
-    And reusable functions are invoked with correct parameter passing semantics
-    And variables/constants are referenced using their PySpark equivalents
-    Then the resulting PySpark code loads, transforms, and produces the same logical result as the original Spark SQL query
-    And the output DataFrame is written or exposed as per the specified output contract (e.g., saved to Delta/Parquet, registered as table or view)
-    And performance optimizations for large-scale PySpark jobs are considered (e.g., broadcast joins for small dimension tables, repartitioning, SQLConfig inheritance)
+  Scenario: Convert Spark SQL queries to PySpark DataFrames with function equivalence (Happy Path)
+    Given all referenced modules and notebook cells are available and accessible
+    When the conversion process is initiated
+    Then all Spark SQL queries must be rewritten using PySpark DataFrame APIs
+    And all SQL joins, aggregations, and filters are implemented with equivalent PySpark code
+    And all referenced SQL tables, views, and CTEs are loaded as DataFrames using their full Unity Catalog names
+    And complex CASE, COALESCE, and conditional logic must use PySpark built-in functions (such as when(), coalesce(), expr(), etc.)
+    And all literal "NULL as <col>" must become F.lit(None).cast(dtype) as <col>
+    And all date_format, left join, group by, row_number, order by, and windowing logic must be implemented using PySpark functions and Window specs
+    And joins between CTEs are performed using DataFrame .join() with appropriate join condition and type
+    And the set of columns in the final select/list exactly matches the SQL output (using withColumn or select as needed)
+    And any variables, widget usage, or constants are fully parameterized
+    And all transformation functions previously imported from "ReusableFunctions" are rewritten in PySpark
+    And all special data formatting (e.g., .cast("double"), date_format, etc.) matches the SQL logic in PySpark expression
+    And all clauses using "IN (...)" and "NOT IN (...)" are implemented using .isin() and ~.isin() logic in PySpark
+    And all data validation is performed in PySpark according to original SQL filter conditions
 
-  Scenario: Missing or incorrect reusable function source (error path)
-    Given at least one referenced function such as "read_control_table" does not have a visible implementation
-    When attempting to convert the SQL logic that requires this function
-    Then an error message is raised with "Source code for function 'read_control_table' not provided. Unable to complete PySpark conversion."
-    And the conversion logs the missing function and affected logic section(s)
+  Scenario Outline: Data-driven validation of error conditions for missing or incomplete notebook content
+    Given the notebook or referenced module <missing_item> is not provided
+    When the conversion process is attempted
+    Then an error must be raised with the message "<error_message>"
 
-  Scenario: Missing variable or constant definition (error path)
-    Given a referenced constant such as "cl_control_table" is not defined in any loaded module
-    When PySpark code translation attempts to interpolate/use this variable
-    Then an error message is raised indicating "Constant 'cl_control_table' not defined. Please provide its definition."
-    And all dependent logic on this constant is flagged as incomplete in the report
-
-  Scenario: Incomplete SQL logic in notebook (error path)
-    Given the attached notebook contains only partial SQL code, clipped or missing the ending CTEs/SELECT
-    When attempting to define the full PySpark DataFrame transformation pipeline
-    Then a blocking error message is returned: "Full SQL logic required. Portion after 'P05 AS (...)' is missing."
-    And the output conversion is halted with a dependency request for the missing logic
-
-  Scenario: Output contract not defined (error path)
-    Given all code and functions are present
-    And the PySpark transformation produces the final DataFrame
-    But it is not specified whether to write as Delta, Parquet, table, or view, nor the save path/mode/partitioning
-    When the conversion reaches the output writing stage
-    Then an error is raised: "Output format and target not specified. Please provide write format, partition key(s), target path or table name, and write mode."
-    And the conversion logs all missing output parameters for correction
-
-  Scenario Outline: Data-driven test of widget variable ingestion and PySpark parameter resolution
-    Given all notebook widget variables are set
-    When the widgets are read from dbutils.widgets.get("<variable>")
-    Then the resulting PySpark variables are assigned as string and used in proper locations
-    And if a widget <widget_name> is missing, an exception is thrown: "Widget value for '<widget_name>' is required but was not provided."
     Examples:
-      | widget_name                |
-      | target_table_path          |
-      | partition_key              |
-      | table_format               |
-      | compression                |
-      | table_name                 |
-      | unity_catalog              |
-      | environment                |
-      | project                    |
-      | load_type                  |
-      | view_unity_catalog_name    |
-      | raw_unity_catalog          |
-      | raw_unity_catalog_hist     |
-      | config_unity_catalog       |
-      | edp_lkp_unity_catalog      |
-      | dims_unity_catalog         |
+      | missing_item                        | error_message                                                                                 |
+      | Constants module                    | "Constants module not found. Please provide ../DA_CCG_RSD_EU/Constants."                      |
+      | ReusableFunctions module            | "ReusableFunctions module not found. Please provide ../DA_CCG_RSD_EU/ReusableFunctions."      |
+      | cl_control_table variable           | "cl_control_table is not defined in Constants module."                                        |
+      | read_control_table function         | "read_control_table function not found in ReusableFunctions."                                 |
+      | get_basejob_url function            | "get_basejob_url function not found in ReusableFunctions."                                    |
+      | Full SQL for P05 and others         | "Incomplete SQL. Please provide full content of fact_wf_supplier_invoice_orafin.ipynb."       |
+      | SQL references undefined variables  | "SQL references undefined variable: <var>. Please define or provide its source."              |
 
-  Scenario Outline: Validation of parameter types, data formats, and reference integrity
-    Given parameter <param_name> (from notebook widget or constant) is available
-    When the value is read into the PySpark workflow
-    Then it must be of type <expected_type>
-    And conform to format <format_description>
-    And if not, an error of type <error_type> is raised with message "<error_msg>"
+  Scenario Outline: Validate data conversion and transformation logic for key fields
+    Given all required modules and notebooks are provided
+    And the input data is loaded from source table <input_table>
+    When the conversion is executed in PySpark
+    Then the resulting DataFrame must conform to the following transformation rules:
+      | Column Name             | Rule                                                                                                                                         |
+      | invc_entry_period       | Must be derived as date_format(invoiced_on_date, "yyyyMM")                                                                                  |
+      | vchr_nbr                | Must be invoice_id cast as string                                                                                                            |
+      | invc_txn_amt            | Must be transaction_amount cast as double                                                                                                    |
+      | div_cd                  | Must follow CASE/COALESCE/LOOKUP logic as in SQL; fallback to hardcoded mapping where lookup is null                                        |
+      | gl_acct_id              | Must concatenate (with "-") COALESCE(gl_balancing_segment, ...), COALESCE(natural_account_segment,...), COALESCE(gl_segment1,...) as string  |
+      | actual_payment_dt       | Must be date_format(check_date, "yyyy-MM-dd"); null if check_date is null                                                                   |
+      | source_country          | Constant string "NA"                                                                                                                         |
+
     Examples:
-      | param_name          | expected_type | format_description             | error_type   | error_msg                                        |
-      | table_name          | string        | non-empty, valid table         | ValueError   | Table name widget is empty or not a string.      |
-      | unity_catalog       | string        | Must be a valid UC catalog     | ValueError   | Unity catalog missing or of invalid format.      |
-      | partition_key       | string        | Valid column in output schema  | KeyError     | Partition key not present in DataFrame columns.  |
-      | environment         | string        | One of [dev, qa, prod]         | ValueError   | Invalid environment specified.                   |
+      | input_table                                    |
+      | finance_prod_raw.dw_ap_sla_aging_invoice_ca     |
+      | finance_prod_raw.dw_ap_sla_expense_dist_cf      |
 
-  Scenario: SQL-specific logic is mapped to PySpark with 100% feature parity 
-    Given all SQL CTEs, filters, joins, and window specifications are present in the provided code
-    When the translation to PySpark is performed
-    Then all calculated columns, join conditions, window functions (ROW_NUMBER OVER PARTITION BY ...), conditional expressions (CASE, COALESCE, IS NULL, etc.), filters, and aggregations are translated using official PySpark DataFrame APIs
-    And the output schema's column names and data types match the original SQL result faithfully
-    And all business logic (see: exclusion filters, COALESCE, data mappings, lookups, constants, CASE logic for div_cd, etc.) are implemented as per the SQL logic
+  Scenario Outline: Validate business rules and error scenarios for data filtering and exclusion
+    Given all pre-requisites are met
+    And the working DataFrame is constructed from CTE logic
+    When applying exclusion filters according to the SQL WHERE clause
+    Then the following exclusion and filter logic must be exactly replicated in PySpark:
+      | Filter Condition                                                                                                                          | Error message if violated                                    |
+      | invoice_accounting_date must be within last 3 years (from current_timestamp)                                                              | "Invoice accounting date out of range: must be >= current year - 3"  |
+      | invoice_source_code NOT IN ('Receivables')                                                                                                | "invoice_source_code is Receivables; should be excluded"               |
+      | (NOT (invoice_source_code = 'MAINFRAME' AND invoice_description LIKE any of [DS%,DR%,PE%,PR%,PS%,RG%,TR%])) OR invoice_description IS null | "MAINFRAME with blocked invoice_description pattern not excluded"      |
+      | natural_account_segment between 4000 and 8999 OR is null                                                                                  | "Invalid natural_account_segment; does not meet allowed range/null"    |
+      | cost_center_segment between 9000 and 9999 OR is null                                                                                      | "Invalid cost_center_segment; does not meet allowed range/null"        |
+      | concat_segments NOT IN (large hardcoded list of IDs) (both dgccd and dgccd_sla joins)                                                     | "concat_segments contains an excluded value"                           |
+      | supplier_number NOT IN ('00032238','00032239','00080463','90000147')                                                                      | "supplier_number is in exclusion list"                                 |
 
-  Scenario: Explicit error message when required business logic or additional domain rules are omitted
-    Given the notebook or requirements reference business or domain-specific logic not visible in SQL
-    When the conversion is attempted without these rules
-    Then an error message is raised specifying the missing rule and where it is needed in the pipeline
-    And documentation is updated to request exact business logic definition
-
-  Scenario: Success criteria for comprehensive validation
-    Given the PySpark conversion is completed
-    When end-to-end tests are executed on representative sample input data
-    Then the PySpark job output matches row count, column names, data types, value correctness, and functional side-effects (e.g., written data location, view registration) of the original Spark SQL implementation
-    And data lineage can be traced from source to target via code and data mapping documentation
-
-  Scenario: Data value and filter validation for exclusion and transformation logic
-    Given explicit SQL filters or exclusions such as
-      | dgsdt_cd.gl_segment_valueset_code = 'Bal Entity FS_CCG_COA' |
-      | YEAR(dasaic.invoice_accounting_date)  >= YEAR(current_timestamp)-3 |
-      | dasaic.invoice_source_code  NOT IN ('Receivables') |
-      | supplier_number NOT IN (00032238,00032239,00080463,90000147) |
-    When these are ported to PySpark
-    Then equivalent DataFrame filter logic uses the same values and semantics
-    And NOT IN/exclusion lists are preserved as literal lists in the PySpark filter
-    And date calculations and expressions use PySpark functions (e.g., year(), current_timestamp()) as per Spark SQL logic
-
-  Scenario: All referenced lookups and joins present and using required lookup tables
-    Given SQL joins reference lookup tables (edp_lkp_unity_catalog, dims_unity_catalog, raw_unity_catalog, etc.)
-    When joining in PySpark code
-    Then left joins (`DataFrame.join(..., how='left')`) are used with exact key fields and join conditions as per the SQL code
-    And join keys and aliases match SQL intent (e.g., using COALESCE as per the SQL logic)
-    And any additional lookup filtering (e.g., lkup_typ_nm='TFS_CC_TO_DIV', upper(lkup_key_01)='USORAFIN') is preserved
-
-  Scenario Outline: Explicit error when referenced tables or columns are missing in the target data source
-    Given input table <table_ref> is referenced in the SQL logic
-    When trying to read this table into a Spark DataFrame
-    Then an error "Table '<table_ref>' does not exist or cannot be loaded." is raised
     Examples:
-      | table_ref                                            |
-      | {raw_unity_catalog}.dw_ap_sla_aging_invoice_ca       |
-      | {dims_unity_catalog}.dim_wf_company                  |
-      | {edp_lkp_unity_catalog}.edp_lkup                     |
+      | violating_row_example                               | violation_condition                                                        |
+      | { invoice_accounting_date: '2018-12-31' }           | invoice_accounting_date must be within last 3 years                        |
+      | { invoice_source_code: 'Receivables' }              | invoice_source_code NOT IN ('Receivables')                                 |
+      | { invoice_source_code: 'MAINFRAME', invoice_description: 'DS123' } | Blocked MAINFRAME description pattern                                     |
+      | { natural_account_segment: 3999 }                   | Not between 4000 and 8999 and not null                                     |
+      | { cost_center_segment: 800 }                        | Not between 9000 and 9999 and not null                                     |
+      | { dgccd.concat_segments: '4009999110011000000000000000' } | Excluded concat_segments value                                             |
+      | { supplier_number: '00032238' }                     | supplier_number in exclusion list                                          |
 
-  Scenario: Proper mapping and fallback for null/empty values and COALESCE logic
-    Given the SQL contains COALESCE, IS NULL, and CASE WHEN null/else logic
-    When mapping to PySpark transformation
-    Then corresponding PySpark logic uses DataFrame.na.fill, .when().otherwise(), and F.coalesce, matching the intended null/value semantics
+  Scenario: Validate output DataFrame schema and column data types
+    Given the PySpark code has executed and produced a result DataFrame
+    When examining the DataFrame schema
+    Then all columns must have the following names and datatypes (PySpark SQL types):
+      | Column Name             | Data Type      |
+      | document_type           | StringType     |
+      | txn_ref_nbr             | StringType     |
+      | invc_entry_period       | StringType     |
+      | po_nbr                  | StringType     |
+      | po_line_nbr             | StringType     |
+      | src_sys_cd              | StringType     |
+      | vchr_nbr                | StringType     |
+      | vchr_line_nbr           | StringType     |
+      | fscl_yr_nbr             | StringType     |
+      | vchr_type_cd            | StringType     |
+      | vchr_status             | StringType     |
+      | item_nbr                | StringType     |
+      | item_desc               | StringType     |
+      | thermo_item_nbr         | StringType     |
+      | supplier_cd             | StringType     |
+      | supplier_name           | StringType     |
+      | supplier_type_cd        | StringType     |
+      | buyer_cd                | StringType     |
+      | document_desc           | StringType     |
+      | invc_txn_type           | StringType     |
+      | buyer_nm                | StringType     |
+      | co_cd                   | StringType     |
+      | co_name                 | StringType     |
+      | hfm_entity              | StringType     |
+      | business_unit           | StringType     |
+      | lcr_flag                | StringType     |
+      | lcr_region              | StringType     |
+      | vomi_flag               | StringType     |
+      | payment_compliance_flg  | StringType     |
+      | po_curncy_cd            | StringType     |
+      | co_curncy_cd            | StringType     |
+      | post_yr_mth_nbr         | StringType     |
+      | invc_entry_dt           | StringType     |
+      | paymt_due_dt            | StringType     |
+      | suplr_invc_dt           | StringType     |
+      | aprval_dt               | StringType     |
+      | txn_orig_id             | StringType     |
+      | suplr_invc_nbr          | StringType     |
+      | invc_apprv_id           | StringType     |
+      | unit_prc                | DoubleType     |
+      | invc_qty                | DoubleType     |
+      | base_qty                | DoubleType     |
+      | invc_txn_amt            | DoubleType     |
+      | invc_co_amt             | DoubleType     |
+      | invc_txn_pmar_amt       | DoubleType     |
+      | invc_co_pmar_amt        | DoubleType     |
+      | unit_prc_pmar_amt       | DoubleType     |
+      | txn_curncy_mth_rt       | DoubleType     |
+      | co_curncy_mth_rt        | DoubleType     |
+      | uom_conv_factor         | DoubleType     |
+      | invc_uom_cd             | StringType     |
+      | base_uom_cd             | StringType     |
+      | profit_cntr             | StringType     |
+      | div_cd                  | StringType     |
+      | site_cd                 | StringType     |
+      | site_name               | StringType     |
+      | reporting_site          | StringType     |
+      | warehouse               | StringType     |
+      | warehouse_nm            | StringType     |
+      | unit                    | StringType     |
+      | nature                  | StringType     |
+      | inv_flg                 | StringType     |
+      | inv_flg_text            | StringType     |
+      | spend_type_cd           | StringType     |
+      | po_paymt_terms_cd       | StringType     |
+      | po_paymt_terms_desc     | StringType     |
+      | suplr_paymt_terms_cd    | StringType     |
+      | suplr_paymt_terms_desc  | StringType     |
+      | fk_orig                 | StringType     |
+      | floor_stock_cd          | StringType     |
+      | contract_flag           | StringType     |
+      | contract_type           | StringType     |
+      | contract_start_date     | StringType     |
+      | contract_end_date       | StringType     |
+      | erp_commondity_cd       | StringType     |
+      | erp_commondity_nm       | StringType     |
+      | sec_supp_cd             | StringType     |
+      | part_rev_no             | StringType     |
+      | cost_centre_cd          | StringType     |
+      | cost_centre_nm          | StringType     |
+      | vendor_mat_no           | StringType     |
+      | gl_acct_id              | StringType     |
+      | gl_acct_nm              | StringType     |
+      | pass_through_field      | StringType     |
+      | pass_through_line       | StringType     |
+      | inv_line_desc           | StringType     |
+      | remit_to_addr_line_1    | StringType     |
+      | remit_to_addr_line_2    | StringType     |
+      | remit_to_addr_line_3    | StringType     |
+      | remit_to_addr_line_4    | StringType     |
+      | remit_to_city_nm        | StringType     |
+      | remit_to_st_cd          | StringType     |
+      | remit_to_rgn_cd         | StringType     |
+      | remit_to_rgn_nm         | StringType     |
+      | remit_to_cntry_cd       | StringType     |
+      | remit_to_cntry_nm       | StringType     |
+      | suplr_nm_src            | StringType     |
+      | rpt_flex1               | StringType     |
+      | invc_txn_amt_clsfctn    | StringType     |
+      | supplier_segment        | StringType     |
+      | ap_payment_term_cd      | StringType     |
+      | ap_payment_term_desc    | StringType     |
+      | actual_payment_dt       | StringType     |
+      | source_country          | StringType     |
 
-  Scenario: Documentation and traceability requirements
-    Given the PySpark code conversion is delivered
-    Then all code sections are commented and documented to reference original SQL logic line/section
-    And functions, constants, and parameter mappings are explained inline or in accompanying documentation to allow traceability
-
+  Scenario: Validate error is raised if full notebook content or all code cells are not provided
+    Given the full untruncated content and all code cells are not available
+    When attempting to generate the PySpark conversion
+    Then an error must be raised with message "Please provide the full, untruncated content of fact_wf_supplier_invoice_orafin.ipynb, including all code cells and all SQL logic."
