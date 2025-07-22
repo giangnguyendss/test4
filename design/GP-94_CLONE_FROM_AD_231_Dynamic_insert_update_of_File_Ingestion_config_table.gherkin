@@ -1,0 +1,145 @@
+Feature: Ingestion of Excel data into ingest_config_master table with upsert (insert/update) logic
+
+  The system must read all records from the provided ingest_config_data.xlsx and perform an UPSERT (insert or update) into the ingest_config_master table in Databricks SQL.
+  - If config_id from Excel does not exist in ingest_config_master, insert the row.
+  - If config_id from Excel exists, update all columns of the existing row with Excel data.
+  - All columns in the Excel sheet must be mapped 1:1 (by header name) to the corresponding columns in ingest_config_master.
+  - If a value is blank in the Excel, overwrite it in the table with NULL.
+  - All operations must succeed or fail atomically; partial updates are not allowed.
+
+  Background:
+    Given the ingest_config_master table exists in Databricks with schema matching the Excel columns
+    And the ingest_config_data.xlsx is accessible from a known path as input (e.g., '/mnt/landing/ingest_config_data.xlsx')
+    And each row in the Excel file contains the following columns, all as strings unless otherwise specified:
+      | Column                       | Sample Value                   | Data Type   | Validation Rule                                               |
+      | config_id                    | 1                              | INT         | Required, unique per row, > 0                                 |
+      | source_object_name           | study_metadata                 | STRING      | Required, non-empty                                          |
+      | source_system                | SystemA                        | STRING      | Required, non-empty                                          |
+      | file_name                    | study_metadata_202403.csv      | STRING      | Required, non-empty                                          |
+      | frequency                    | Daily                          | STRING      | Required, Enum(Daily, Weekly, Monthly, etc.)                 |
+      | location                     | US                             | STRING      | Required, non-empty                                          |
+      | domain                       | Clinical                       | STRING      | Required, non-empty                                          |
+      | sub_domain                   | Trials                         | STRING      | Required, non-empty                                          |
+      | active_flag                  | 1                              | INT         | Required, 0 or 1                                             |
+      | s3_vendor_path               | s3://vendor/systema            | STRING      | Required, must be a valid S3 path                            |
+      | source_path                  | /data/incoming/systema         | STRING      | Required, filesystem path format                             |
+      | s3_landing_path              | s3://landing/systema           | STRING      | Required, must be a valid S3 path                            |
+      | s3_archive_path              | s3://archive/systema           | STRING      | Required, must be a valid S3 path                            |
+      | delta_load_ts                | 2024-03-15 10:00:00            | TIMESTAMP   | Optional, format yyyy-MM-dd HH:mm:ss, nullable               |
+      | full_or_incremental_load     | Incremental                    | STRING      | Required, Enum(Full, Incremental)                            |
+      | zip_file                     | No                             | STRING      | Required, Enum(Yes, No)                                      |
+      | vendor                       | VendorA                        | STRING      | Required, non-empty                                          |
+      | delimiter                    | ,                              | STRING      | Optional, if present: 1 char                                 |
+      | source_landing               | SystemA_Landing                | STRING      | Required, non-empty                                          |
+      | src_landing_table_name       | study_metadata_landing         | STRING      | Required, non-empty                                          |
+      | publish_unstitched           | Yes                            | STRING      | Required, Enum(Yes, No)                                      |
+      | publish_unstitched_table_name| study_metadata_unstitched      | STRING      | Optional, nullable                                           |
+      | publish_stitched             | Yes                            | STRING      | Required, Enum(Yes, No)                                      |
+      | publish_stitched_table_name  | study_metadata_stitched        | STRING      | Optional, nullable                                           |
+      | primary_key                  | study_id                       | STRING      | Required, non-empty                                          |
+      | header                       | Yes                            | STRING      | Required, Enum(Yes, No)                                      |
+      | date_pattern                 | yyyy-MM-dd                     | STRING      | Optional, Non-empty if present                               |
+      | actual_file_name             | study_metadata_20240315.csv    | STRING      | Required, non-empty                                          |
+      | vendor_file_deletion_flag    | No                             | STRING      | Required, Enum(Yes, No)                                      |
+      | file_recursive_flag          | Yes                            | STRING      | Required, Enum(Yes, No)                                      |
+      | total_weeks_req_data         | 12                             | INT         | Required, >= 0                                               |
+      | total_weeks_file_data        | 10                             | INT         | Required, >= 0                                               |
+    And all columns are trimmed of whitespace when used for insert/update
+
+  Scenario Outline: Successful UPSERT of records when config_id does not exist (insert new rows)
+    Given the ingest_config_master table does not contain a row with config_id = <config_id>
+    When the Excel row with config_id = <config_id> is read from ingest_config_data.xlsx
+    Then a new row with config_id = <config_id> and all column values from Excel is inserted into ingest_config_master
+
+    Examples:
+      | config_id | source_object_name | source_system | file_name                   | frequency | location | domain    | sub_domain | active_flag | s3_vendor_path        | source_path              | s3_landing_path       | s3_archive_path     | delta_load_ts         | full_or_incremental_load | zip_file | vendor  | delimiter | source_landing     | src_landing_table_name | publish_unstitched | publish_unstitched_table_name | publish_stitched | publish_stitched_table_name | primary_key      | header | date_pattern | actual_file_name                   | vendor_file_deletion_flag | file_recursive_flag | total_weeks_req_data | total_weeks_file_data |
+      | 101       | new_object         | NewSystem     | newfile.csv                | Daily     | US       | Clinical  | Trials     | 1          | s3://vendor/newsystem | /data/incoming/newsystem | s3://landing/newsystem | s3://archive/newsystem | 2024-04-10 12:00:00 | Incremental              | No       | VendorN | ,         | NewSystem_Landing  | newfile_landing        | Yes                | newfile_unstitched            | Yes              | newfile_stitched             | new_id           | Yes    | yyyy-MM-dd   | newfile_20240410.csv               | No                        | Yes                 | 12                   | 10                   |
+
+  Scenario Outline: Successful UPSERT of records when config_id exists (update existing row)
+    Given the ingest_config_master table contains a row with config_id = <config_id>
+    And at least one column value is different between table row and the Excel row
+    When the Excel row with config_id = <config_id> is read from ingest_config_data.xlsx
+    Then the existing row with config_id = <config_id> in ingest_config_master is updated with all values from Excel
+
+    Examples:
+      | config_id | source_object_name | source_system | file_name                 | frequency | location | domain  | sub_domain | active_flag | s3_vendor_path         | source_path                | s3_landing_path          | s3_archive_path         | delta_load_ts         | full_or_incremental_load | zip_file | vendor  | delimiter | source_landing     | src_landing_table_name | publish_unstitched | publish_unstitched_table_name | publish_stitched | publish_stitched_table_name | primary_key    | header | date_pattern | actual_file_name         | vendor_file_deletion_flag | file_recursive_flag | total_weeks_req_data | total_weeks_file_data |
+      | 1         | study_metadata_v2  | SystemA       | study_metadata_202404.csv | Daily     | US       | Clinical| Trials     | 1          | s3://vendor/systema_v2 | /data/incoming/systema_v2  | s3://landing/systema_v2  | s3://archive/systema_v2 | 2024-04-15 11:00:00   | Incremental              | No       | VendorA | ,         | SystemA_Landing    | study_metadata_landing | Yes                | study_metadata_unstitched     | Yes              | study_metadata_stitched     | study_id       | Yes    | yyyy-MM-dd   | study_metadata_20240415.csv | No                        | Yes                 | 15                   | 13                   |
+
+  Scenario: Excel field value is blank, updates table column to NULL
+    Given the ingest_config_master table contains a row with config_id = 2
+    And the Excel row for config_id = 2 has publish_unstitched_table_name blank
+    When the Excel row with config_id = 2 is processed
+    Then the column publish_unstitched_table_name in the table row is set to NULL
+
+  Scenario: Excel field is missing for a non-nullable column (Validation error)
+    Given the ingest_config_master table for config_id = 3 exists
+    And the Excel row for config_id = 3 has source_system as blank
+    When the row is processed
+    Then the ingestion fails
+    And an error message is captured: "Validation error: source_system is required and cannot be blank for config_id = 3."
+
+  Scenario: Attempt to insert a row with duplicate config_id in same Excel file (Validation error)
+    Given the ingest_config_data.xlsx has two rows with config_id = 4
+    When processing the Excel for upsert
+    Then the ingestion fails
+    And an error message is logged: "Duplicate config_id value (4) found in input Excel."
+
+  Scenario: Active_flag not in allowed set (Validation error)
+    Given the Excel row for config_id = 5 has active_flag as 2
+    When the row is processed
+    Then the ingestion fails for this row
+    And an error message is returned: "Validation error: active_flag must be either 0 or 1 for config_id = 5."
+
+  Scenario: Attempt to insert row with invalid timestamp format (Validation error)
+    Given the Excel row for config_id = 6 has delta_load_ts = "15-04-2024 10:00"
+    When the row is processed
+    Then the ingestion fails for this row
+    And an error message is returned: "Validation error: delta_load_ts must be in format yyyy-MM-dd HH:mm:ss for config_id = 6."
+
+  Scenario: Attempt to insert row with missing required column (Validation error)
+    Given the Excel row for config_id = 7 is missing primary_key
+    When the row is processed
+    Then the ingestion fails for this row
+    And an error message is returned: "Validation error: primary_key is required for config_id = 7."
+
+  Scenario: Attempt to insert row with negative total_weeks_req_data (Validation error)
+    Given the Excel row for config_id = 8 has total_weeks_req_data = -1
+    When the row is processed
+    Then the ingestion fails for this row
+    And an error message is returned: "Validation error: total_weeks_req_data must be >= 0 for config_id = 8."
+
+  Scenario: Correct update where Excel value is different but non-null
+    Given the table row for config_id = 2 has file_recursive_flag = No
+    When the Excel for config_id = 2 has file_recursive_flag = Yes
+    And the row is processed
+    Then the table row for config_id = 2 has file_recursive_flag = Yes
+
+  Scenario Outline: Validation of ENUM columns
+    Given the column <column> must only take allowed values <allowed>
+    When the Excel row for config_id = <config_id> has <column> = <illegal_value>
+    Then the ingestion fails for this row
+    And an error message is returned: "Validation error: <column> must be one of <allowed> for config_id = <config_id>."
+
+    Examples:
+      | config_id | column                         | allowed               | illegal_value  |
+      | 9         | publish_unstitched             | [Yes, No]            | MAYBE          |
+      | 10        | full_or_incremental_load       | [Full, Incremental]   | Partial        |
+      | 11        | vendor_file_deletion_flag      | [Yes, No]            | TRUE           |
+
+  Scenario: Insertion is atomic across all records
+    Given ingest_config_master is initially empty
+    And the Excel has 3 rows, one of which (config_id=12) fails validation (e.g., missing file_name)
+    When ingestion is started
+    Then no data is inserted/updated in ingest_config_master
+    And a summary error: "Atomic upsert failed due to validation errors. No records committed."
+
+  Scenario: Data fields are trimmed before insert/update
+    Given the Excel row for config_id = 13 has leading/trailing spaces in source_system
+    When the row is processed
+    Then the value is trimmed before insert/update
+
+  Scenario: All original 30 Excel records ingest successfully with valid data
+    Given ingest_config_master is empty or only has config_id not in [1-30]
+    When all 30 Excel rows are processed
+    Then 30 rows with config_id [1-30] exist in ingest_config_master with all field values matching Excel
+
