@@ -1,0 +1,141 @@
+Feature: Convert Spark SQL notebook to PySpark with functions and variables fidelity
+
+  As a data engineer, I need to convert the provided Spark.SQL() code and all supporting logic in "fact_wf_supplier_invoice_orafin.ipynb" to idiomatic PySpark, including implementing or mapping all referenced reusable functions and constants, and ensuring that variable, function, parameter, and output handling is preserved according to the notebook's requirements and business logic.
+
+  Background:
+    Given the full content of the "fact_wf_supplier_invoice_orafin.ipynb" notebook is available
+    And the complete source code of all referenced reusable functions in DA_CCG_RSD_EU/ReusableFunctions is provided
+    And the complete definition of all constants in DA_CCG_RSD_EU/Constants is provided
+    And all required table and Unity Catalog/variable values (raw_unity_catalog, raw_unity_catalog_hist, edp_lkp_unity_catalog, dims_unity_catalog, config_unity_catalog, cl_control_table, etc.) are accessible
+    And the functional requirements and output contract (output DataFrame/table/view, write mode, locations, formats, partitioning) are fully specified
+
+  Scenario: Successful conversion of notebook to PySpark with function mapping (happy path)
+    Given all variable widgets (target_table_path, partition_key, table_format, compression, table_name, unity_catalog, etc.) have proper values and types as string
+    And required functions like "read_control_table" and "get_basejob_url" are available as PySpark functions
+    And referenced tables and views exist in the specified Unity Catalogs
+    When the Spark SQL code block is translated to equivalent PySpark DataFrame transformations using PySpark API (e.g., DataFrame.withColumn, join, filter, select, Window functions, etc.)
+    And reusable functions are invoked with correct parameter passing semantics
+    And variables/constants are referenced using their PySpark equivalents
+    Then the resulting PySpark code loads, transforms, and produces the same logical result as the original Spark SQL query
+    And the output DataFrame is written or exposed as per the specified output contract (e.g., saved to Delta/Parquet, registered as table or view)
+    And performance optimizations for large-scale PySpark jobs are considered (e.g., broadcast joins for small dimension tables, repartitioning, SQLConfig inheritance)
+
+  Scenario: Missing or incorrect reusable function source (error path)
+    Given at least one referenced function such as "read_control_table" does not have a visible implementation
+    When attempting to convert the SQL logic that requires this function
+    Then an error message is raised with "Source code for function 'read_control_table' not provided. Unable to complete PySpark conversion."
+    And the conversion logs the missing function and affected logic section(s)
+
+  Scenario: Missing variable or constant definition (error path)
+    Given a referenced constant such as "cl_control_table" is not defined in any loaded module
+    When PySpark code translation attempts to interpolate/use this variable
+    Then an error message is raised indicating "Constant 'cl_control_table' not defined. Please provide its definition."
+    And all dependent logic on this constant is flagged as incomplete in the report
+
+  Scenario: Incomplete SQL logic in notebook (error path)
+    Given the attached notebook contains only partial SQL code, clipped or missing the ending CTEs/SELECT
+    When attempting to define the full PySpark DataFrame transformation pipeline
+    Then a blocking error message is returned: "Full SQL logic required. Portion after 'P05 AS (...)' is missing."
+    And the output conversion is halted with a dependency request for the missing logic
+
+  Scenario: Output contract not defined (error path)
+    Given all code and functions are present
+    And the PySpark transformation produces the final DataFrame
+    But it is not specified whether to write as Delta, Parquet, table, or view, nor the save path/mode/partitioning
+    When the conversion reaches the output writing stage
+    Then an error is raised: "Output format and target not specified. Please provide write format, partition key(s), target path or table name, and write mode."
+    And the conversion logs all missing output parameters for correction
+
+  Scenario Outline: Data-driven test of widget variable ingestion and PySpark parameter resolution
+    Given all notebook widget variables are set
+    When the widgets are read from dbutils.widgets.get("<variable>")
+    Then the resulting PySpark variables are assigned as string and used in proper locations
+    And if a widget <widget_name> is missing, an exception is thrown: "Widget value for '<widget_name>' is required but was not provided."
+    Examples:
+      | widget_name                |
+      | target_table_path          |
+      | partition_key              |
+      | table_format               |
+      | compression                |
+      | table_name                 |
+      | unity_catalog              |
+      | environment                |
+      | project                    |
+      | load_type                  |
+      | view_unity_catalog_name    |
+      | raw_unity_catalog          |
+      | raw_unity_catalog_hist     |
+      | config_unity_catalog       |
+      | edp_lkp_unity_catalog      |
+      | dims_unity_catalog         |
+
+  Scenario Outline: Validation of parameter types, data formats, and reference integrity
+    Given parameter <param_name> (from notebook widget or constant) is available
+    When the value is read into the PySpark workflow
+    Then it must be of type <expected_type>
+    And conform to format <format_description>
+    And if not, an error of type <error_type> is raised with message "<error_msg>"
+    Examples:
+      | param_name          | expected_type | format_description             | error_type   | error_msg                                        |
+      | table_name          | string        | non-empty, valid table         | ValueError   | Table name widget is empty or not a string.      |
+      | unity_catalog       | string        | Must be a valid UC catalog     | ValueError   | Unity catalog missing or of invalid format.      |
+      | partition_key       | string        | Valid column in output schema  | KeyError     | Partition key not present in DataFrame columns.  |
+      | environment         | string        | One of [dev, qa, prod]         | ValueError   | Invalid environment specified.                   |
+
+  Scenario: SQL-specific logic is mapped to PySpark with 100% feature parity 
+    Given all SQL CTEs, filters, joins, and window specifications are present in the provided code
+    When the translation to PySpark is performed
+    Then all calculated columns, join conditions, window functions (ROW_NUMBER OVER PARTITION BY ...), conditional expressions (CASE, COALESCE, IS NULL, etc.), filters, and aggregations are translated using official PySpark DataFrame APIs
+    And the output schema's column names and data types match the original SQL result faithfully
+    And all business logic (see: exclusion filters, COALESCE, data mappings, lookups, constants, CASE logic for div_cd, etc.) are implemented as per the SQL logic
+
+  Scenario: Explicit error message when required business logic or additional domain rules are omitted
+    Given the notebook or requirements reference business or domain-specific logic not visible in SQL
+    When the conversion is attempted without these rules
+    Then an error message is raised specifying the missing rule and where it is needed in the pipeline
+    And documentation is updated to request exact business logic definition
+
+  Scenario: Success criteria for comprehensive validation
+    Given the PySpark conversion is completed
+    When end-to-end tests are executed on representative sample input data
+    Then the PySpark job output matches row count, column names, data types, value correctness, and functional side-effects (e.g., written data location, view registration) of the original Spark SQL implementation
+    And data lineage can be traced from source to target via code and data mapping documentation
+
+  Scenario: Data value and filter validation for exclusion and transformation logic
+    Given explicit SQL filters or exclusions such as
+      | dgsdt_cd.gl_segment_valueset_code = 'Bal Entity FS_CCG_COA' |
+      | YEAR(dasaic.invoice_accounting_date)  >= YEAR(current_timestamp)-3 |
+      | dasaic.invoice_source_code  NOT IN ('Receivables') |
+      | supplier_number NOT IN (00032238,00032239,00080463,90000147) |
+    When these are ported to PySpark
+    Then equivalent DataFrame filter logic uses the same values and semantics
+    And NOT IN/exclusion lists are preserved as literal lists in the PySpark filter
+    And date calculations and expressions use PySpark functions (e.g., year(), current_timestamp()) as per Spark SQL logic
+
+  Scenario: All referenced lookups and joins present and using required lookup tables
+    Given SQL joins reference lookup tables (edp_lkp_unity_catalog, dims_unity_catalog, raw_unity_catalog, etc.)
+    When joining in PySpark code
+    Then left joins (`DataFrame.join(..., how='left')`) are used with exact key fields and join conditions as per the SQL code
+    And join keys and aliases match SQL intent (e.g., using COALESCE as per the SQL logic)
+    And any additional lookup filtering (e.g., lkup_typ_nm='TFS_CC_TO_DIV', upper(lkup_key_01)='USORAFIN') is preserved
+
+  Scenario Outline: Explicit error when referenced tables or columns are missing in the target data source
+    Given input table <table_ref> is referenced in the SQL logic
+    When trying to read this table into a Spark DataFrame
+    Then an error "Table '<table_ref>' does not exist or cannot be loaded." is raised
+    Examples:
+      | table_ref                                            |
+      | {raw_unity_catalog}.dw_ap_sla_aging_invoice_ca       |
+      | {dims_unity_catalog}.dim_wf_company                  |
+      | {edp_lkp_unity_catalog}.edp_lkup                     |
+
+  Scenario: Proper mapping and fallback for null/empty values and COALESCE logic
+    Given the SQL contains COALESCE, IS NULL, and CASE WHEN null/else logic
+    When mapping to PySpark transformation
+    Then corresponding PySpark logic uses DataFrame.na.fill, .when().otherwise(), and F.coalesce, matching the intended null/value semantics
+
+  Scenario: Documentation and traceability requirements
+    Given the PySpark code conversion is delivered
+    Then all code sections are commented and documented to reference original SQL logic line/section
+    And functions, constants, and parameter mappings are explained inline or in accompanying documentation to allow traceability
+
