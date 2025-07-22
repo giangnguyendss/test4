@@ -1,0 +1,170 @@
+Feature: Extract fields from JSON string in product_details column of purgo_playground.d_product_revenue
+
+  This feature ensures Databricks SQL extracts each specified field from the JSON string stored in the product_details column, outputting batch_number, expiration_date, manufacturing_site, regulatory_approval, and price as individual columns, with strict data type handling and error checking.
+
+  Background:
+    Given the table purgo_playground.d_product_revenue exists
+    And the table contains a column named product_details of datatype string
+    And product_details contains valid JSON objects with possible fields:
+      | batch_number (string)          |
+      | expiration_date (string in 'yyyy-MM-dd' format) |
+      | manufacturing_site (string)    |
+      | regulatory_approval (string)   |
+      | price (numeric, e.g., 250.75)  |
+
+  # Happy Path
+  Scenario: Extract all expected fields from a valid product_details JSON string
+    Given a row in purgo_playground.d_product_revenue where product_details is
+      """
+      {
+        "batch_number": "BATCH2024-5678",
+        "expiration_date": "2025-12-31",
+        "manufacturing_site": "Site A",
+        "regulatory_approval": "Approved",
+        "price": 250.75
+      }
+      """
+    When the SQL query to extract each JSON field is executed
+    Then the result has columns batch_number, expiration_date, manufacturing_site, regulatory_approval, and price
+    And the row values are:
+      | batch_number     | expiration_date | manufacturing_site | regulatory_approval | price  |
+      | BATCH2024-5678   | 2025-12-31      | Site A             | Approved            | 250.75 |
+
+  # Data-driven test: field data types, formatting, and missing fields
+  Scenario Outline: Extract fields from product_details with various valid and missing values
+    Given a row with product_details:
+      """
+      {
+        "batch_number": "<batch_number>",
+        "expiration_date": "<expiration_date>",
+        "manufacturing_site": "<manufacturing_site>",
+        "regulatory_approval": "<regulatory_approval>",
+        "price": <price>
+      }
+      """
+    When the SQL query is executed
+    Then the extracted fields should have the following values and types:
+      | batch_number  (string) | expiration_date (date as string) | manufacturing_site (string) | regulatory_approval (string) | price (DECIMAL(10,2)) |
+      | <batch_number>         | <expiration_date>                | <manufacturing_site>        | <regulatory_approval>        | <price>               |
+
+    Examples:
+      | batch_number      | expiration_date | manufacturing_site | regulatory_approval | price     |
+      | BATCH2023-1010    | 2024-11-01      | Factory West       | Pending             | 199.00    |
+      | BATCH2022-3333    | 2023-05-15      | Plant X            | Denied              | 0.00      |
+
+  Scenario Outline: Handle missing expected keys in product_details
+    Given a row with product_details:
+      """
+      {
+        <json_content>
+      }
+      """
+    When the SQL query is executed
+    Then the extracted columns are:
+      | batch_number | expiration_date | manufacturing_site | regulatory_approval | price |
+    And the output values are:
+      | <batch_number> | <expiration_date> | <manufacturing_site> | <regulatory_approval> | <price> |
+
+    Examples:
+      | json_content                                                                                               | batch_number  | expiration_date | manufacturing_site | regulatory_approval | price    |
+      | "manufacturing_site": "Site B", "regulatory_approval": "Approved", "price": 99.99                         | NULL          | NULL            | Site B             | Approved            | 99.99    |
+      | "batch_number": "BATCH9999"                                                                               | BATCH9999     | NULL            | NULL               | NULL                | NULL     |
+      |                                                                                                           | NULL          | NULL            | NULL               | NULL                | NULL     |
+
+  Scenario: Handle incorrectly formatted JSON in product_details
+    Given a row in purgo_playground.d_product_revenue where product_details is "{ batch_number: BATCH2024-5678, regulatory_approval }"
+    When the SQL query is executed
+    Then an error is raised with message matching "Malformed JSON in product_details"
+
+  Scenario: Handle price as string versus number
+    Given a row in purgo_playground.d_product_revenue where product_details is
+      """
+      {
+        "batch_number": "BATCH2025-0001",
+        "expiration_date": "2026-03-17",
+        "manufacturing_site": "Site C",
+        "regulatory_approval": "Approved",
+        "price": "249.50"
+      }
+      """
+    When the SQL query is executed
+    Then the price column should be cast to DECIMAL(10,2) and have value 249.50
+
+  Scenario: Reject non-numeric price values
+    Given a row in purgo_playground.d_product_revenue where product_details is
+      """
+      {
+        "batch_number": "BATCH2026-3333",
+        "expiration_date": "2027-01-09",
+        "manufacturing_site": "Site Q",
+        "regulatory_approval": "Approved",
+        "price": "NotANumber"
+      }
+      """
+    When the SQL query is executed
+    Then the row is returned with price as NULL
+
+  Scenario Outline: Enforce expiration_date to be in yyyy-MM-dd format
+    Given a row in purgo_playground.d_product_revenue where product_details is
+      """
+      {
+        "batch_number": "BATCH2029-0007",
+        "expiration_date": "<expiration_date>",
+        "manufacturing_site": "Site Y",
+        "regulatory_approval": "Approved",
+        "price": 180.00
+      }
+      """
+    When the SQL query is executed
+    Then the expiration_date column should have value <expected_value>
+    And if the expiration_date format is invalid, expiration_date is returned as NULL
+
+    Examples:
+      | expiration_date | expected_value |
+      | 2030-02-28      | 2030-02-28     |
+      | 02-28-2030      | NULL           |
+      | 2030/02/28      | NULL           |
+      |                 | NULL           |
+
+  Scenario: Ignore extra fields in the JSON
+    Given a row in purgo_playground.d_product_revenue where product_details is
+      """
+      {
+        "batch_number": "BATCHXTRA-1234",
+        "expiration_date": "2028-09-10",
+        "manufacturing_site": "Site Extra",
+        "regulatory_approval": "Approved",
+        "price": 999.99,
+        "extra_field": "ThisShouldBeIgnored"
+      }
+      """
+    When the SQL query is executed
+    Then only batch_number, expiration_date, manufacturing_site, regulatory_approval, price columns are present
+    And extra_field is not present in the output
+
+  # Technical Validation Rule Summary
+  Scenario: SQL query must use strict JSON extraction and casting
+    Given the SQL query is to be written for Databricks
+    Then the query must use extract_json_string/product_details with GET_JSON_OBJECT, CAST where appropriate
+    And casting must enforce these types:
+      | batch_number          | STRING           |
+      | expiration_date       | STRING           |
+      | manufacturing_site    | STRING           |
+      | regulatory_approval   | STRING           |
+      | price                 | DECIMAL(10,2)    |
+    And missing or incorrectly typed fields must result in NULL for output column
+    And malformed JSON must return an error
+
+  Scenario: The SQL query executes successfully without syntax or runtime errors
+    Given purgo_playground.d_product_revenue is accessible and product_details contains valid JSON strings
+    When the SQL query is executed to extract the five expected fields from the product_details JSON string
+    Then the query runs without error
+    And returns a result set with one column per expected key
+
+  Scenario: The SQL result column names conform to the JSON key names in lower_snake_case
+
+  Scenario: No filtering is applied—all rows are included in the extraction
+
+  Scenario: The SQL query output contains NULL for any missing JSON field in any row
+
+  Scenario: Each key is extracted strictly as per provided JSON structure; no inference or transformation beyond casting
