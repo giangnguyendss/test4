@@ -1,0 +1,100 @@
+Feature: Real-Time Inventory at Risk Calculation Based on DNSA Events in Life Sciences Manufacturing
+
+  This feature calculates 'inventory_at_risk' and the percentage of inventory at risk based on the 'dnsa_flag' and 'flag_active' fields in the 'purgo_demo.f_inv_movmnt' table. Results rely on strict value matching and defined output formats for Spark SQL processing.
+
+  Background:
+    Given the Unity Catalog table "purgo_demo.f_inv_movmnt" exists
+    And the table contains columns: "dnsa_flag", "flag_active", "financial_qty", "inventory_id"
+    And "financial_qty" is a non-negative decimal (precision at least 2 digits after the point) representing inventory quantity per movement record
+    And "dnsa_flag" is a string value indicating DNSA event status with expected values 'yes', 'no', 'YES', 'NO', or NULL
+    And "flag_active" is a string with expected values 'Y', 'N', 'y', 'n', or NULL
+    And "inventory_id" is a unique string identifier for each inventory movement
+    And total inventory is defined as the sum of "financial_qty" for all movement records in "purgo_demo.f_inv_movmnt" without any filters applied
+    And inventory at risk is defined as the sum of "financial_qty" for all records where "flag_active" in ('Y', 'y') AND "dnsa_flag" in ('yes', 'YES')
+    And percentage of inventory at risk is calculated as (inventory_at_risk / total_inventory) * 100, rounded to 2 decimal places
+
+  Scenario: Calculate inventory at risk and percentage when DNSA events are present and active
+    Given the table contains the following records:
+      | inventory_id | financial_qty | dnsa_flag | flag_active |
+      | A1           | 100.50        | yes       | Y           |
+      | A2           | 200.00        | no        | Y           |
+      | A3           | 50.00         | yes       | N           |
+      | A4           | 75.00         | YES       | y           |
+      | A5           | 25.00         | no        | y           |
+      | A6           | 30.00         | YES       | N           |
+    When the inventory at risk calculation is executed
+    Then the inventory_at_risk should be 100.50 + 75.00 = 175.50
+    And the total_inventory should be 100.50 + 200.00 + 50.00 + 75.00 + 25.00 + 30.00 = 480.50
+    And the percentage_of_inventory_at_risk should be (175.50 / 480.50) * 100 = 36.53
+
+  Scenario Outline: Validate case sensitivity and flag combinations for inventory at risk
+    Given the table contains a record:
+      | inventory_id | financial_qty | dnsa_flag | flag_active |
+      | <id>         | <qty>         | <dnsa>    | <active>    |
+    When the inventory at risk calculation is executed
+    Then the record is <included> in inventory_at_risk
+
+    Examples:
+      | id    | qty    | dnsa   | active | included         |
+      | B1    | 50.00  | yes    | Y      | included         |
+      | B2    | 25.50  | YES    | y      | included         |
+      | B3    | 40.00  | no     | Y      | not included     |
+      | B4    | 30.50  | YES    | N      | not included     |
+      | B5    | 44.00  | Yes    | y      | not included     |
+      | B6    | 20.00  | yes    | n      | not included     |
+      | B7    | 10.00  | no     | N      | not included     |
+      | B8    | 80.00  | NULL   | Y      | not included     |
+      | B9    | 12.00  | YES    | NULL   | not included     |
+
+  Scenario: Total inventory includes all records regardless of DNSA or flag_active status
+    Given the table contains multiple records with mixed flag values
+    When the total inventory calculation is executed
+    Then all "financial_qty" values in the table are summed for total_inventory
+
+  Scenario: Error when financial_qty is negative
+    Given the table contains a record with "financial_qty" = -10.00
+    When the inventory at risk calculation is executed
+    Then an error is raised with the message "Invalid financial_qty: cannot be negative"
+
+  Scenario: Handle null or missing dnsa_flag or flag_active fields
+    Given the table contains a record with dnsa_flag or flag_active as NULL
+    When the inventory at risk calculation is executed
+    Then the record is not included in inventory_at_risk
+    And the record is included in total_inventory
+
+  Scenario: No DNSA inventory at risk present
+    Given all records in the table have either flag_active not equal to 'Y'/'y' or dnsa_flag not equal to 'yes'/'YES'
+    When the inventory at risk calculation is executed
+    Then the inventory_at_risk should be 0
+    And the percentage_of_inventory_at_risk should be 0.00
+
+  Scenario: Error when total_inventory is zero
+    Given the table is empty or all financial_qty values are zero
+    When the percentage of inventory at risk is calculated
+    Then an error is raised with the message "Total inventory is zero, cannot calculate percentage"
+
+  Scenario: Output format for real-time dashboard/report
+    Given the calculations are executed successfully
+    Then the output should include fields: inventory_at_risk (decimal), total_inventory (decimal), percentage_of_inventory_at_risk (decimal, 2 decimals)
+    And the output should be written to a designated table or view as per configuration
+
+  Scenario: Secure data access
+    Given the calculations are implemented using data from purgo_demo.f_inv_movmnt
+    When a user without necessary Unity Catalog permissions attempts to run the calculation
+    Then access is denied with the message "Insufficient privileges for purgo_demo.f_inv_movmnt"
+
+  Scenario Outline: Error conditions for invalid flag values
+    Given the table contains a record with dnsa_flag = <dnsa>, flag_active = <active>
+    When the inventory at risk calculation is executed
+    Then the record is not included in inventory_at_risk
+    And the system logs a warning: "Unexpected flag value encountered"
+
+    Examples:
+      | dnsa     | active   |
+      | yess     | Y        |
+      | YES      | active   |
+      | no       | yes      |
+      | 1        | Y        |
+      | YES      | 1        |
+      |          | Y        |
+      | YES      |          |
