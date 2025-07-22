@@ -1,0 +1,123 @@
+Feature: Backup and vacuum of customer_360_raw table in Databricks
+
+  As a Data Engineer
+  I want to efficiently back up customer_360_raw table data as compressed parquet files partitioned by state
+  And vacuum the original source table to retain only the last 30 days of records
+  So that storage is optimized without compromising data retrieval or quality
+
+  Background:
+    Given the Databricks Unity Catalog table "purgo_databricks.purgo_playground.customer_360_raw" exists
+    And the Unity Catalog table is accessible with read permissions
+    And the backup destination volume "Volumes/customer_360_raw_backup" exists and is writable
+    And the customer_360_raw table has a column named "state" for partitioning
+    And the retention column for the vacuum operation is "updated_at" of datatype TIMESTAMP in "yyyy-MM-dd HH:mm:ss" format
+    And all columns are to be included in the backup
+    And the backup parquet files must use Snappy compression
+    And old Parquet backups in the backup volume are not deleted as part of this process
+    And the script is run manually or as scheduled by external orchestration
+
+  Scenario: Successful backup of customer_360_raw table as partitioned, compressed Parquet files
+    Given the Unity Catalog table "purgo_databricks.purgo_playground.customer_360_raw" contains records with valid "state" values (e.g., "CA", "NY", "TX")
+    When the PySpark backup script is executed
+    Then all records from "purgo_databricks.purgo_playground.customer_360_raw" are written to Parquet files in "Volumes/customer_360_raw_backup"
+    And the backup files are partitioned by the "state" column
+    And the backup files are compressed using Snappy compression
+    And all columns from the source table are included in the backup
+    And the Parquet files are validated for schema correctness and partitioning
+
+  Scenario Outline: Error when backup volume is not available or writable
+    Given the backup volume "<backup_volume>" does not exist or is not writable
+    When the PySpark backup script is executed
+    Then the script fails with error message "<error_message>"
+
+    Examples:
+      | backup_volume                      | error_message                                                       |
+      | Volumes/missing_backup_volume      | Backup volume Volumes/missing_backup_volume does not exist.         |
+      | Volumes/readonly_backup_volume     | Backup volume Volumes/readonly_backup_volume is not writable.       |
+
+  Scenario: Error when customer_360_raw table is not accessible
+    Given the Unity Catalog table "purgo_databricks.purgo_playground.customer_360_raw" does not exist or is not accessible
+    When the PySpark backup script is executed
+    Then the script fails with error message "Source table purgo_databricks.purgo_playground.customer_360_raw does not exist or is not accessible."
+
+  Scenario Outline: Error when "state" column contains null or invalid values during backup
+    Given the Unity Catalog table contains rows with invalid "state" values ("<state_value>")
+    When the PySpark backup script attempts to partition by the "state" column
+    Then the script moves records with null or empty "state" to the "__INVALID_STATE__" partition
+    And logs a warning "Found records with null/blank 'state'; stored under __INVALID_STATE__ partition."
+
+    Examples:
+      | state_value |
+      | null        |
+      | ""          |
+
+  Scenario: Successful vacuum of customer_360_raw table retaining last 30 days of records (based on updated_at field)
+    Given the Unity Catalog table contains records with "updated_at" timestamp values
+    When the Databricks VACUUM RETAIN operation is triggered for "purgo_databricks.purgo_playground.customer_360_raw"
+    And the vacuum retains all records with "updated_at" >= (current_timestamp - interval 30 days)
+    Then records older than 30 days based on the "updated_at" field are permanently deleted from the original table
+    And no records with "updated_at" >= (current_timestamp - interval 30 days) are deleted
+
+  Scenario: Error when "updated_at" column is missing or has incorrect datatype for vacuum operation
+    Given the Unity Catalog table does not contain the "updated_at" column or it's not of TIMESTAMP type
+    When the Databricks VACUUM operation is attempted
+    Then the vacuum process fails with error message "Column 'updated_at' missing or not of type TIMESTAMP; cannot perform time-based vacuum operation."
+
+  Scenario Outline: Data-driven test for backup partitioning correctness
+    Given the Unity Catalog table contains records with the following values:
+      | customer_id | state | updated_at          |
+      | 1001        | NY    | 2024-06-01 10:25:00 |
+      | 1002        | TX    | 2024-05-15 14:30:00 |
+      | 1003        | CA    | 2024-04-28 09:45:00 |
+      | 1004        | NY    | 2024-05-31 16:18:00 |
+    When the PySpark backup script is executed
+    Then a directory "Volumes/customer_360_raw_backup/state=<partition_state>" exists for each state value in the data
+    And all records with state="<partition_state>" are written to the corresponding partition
+
+    Examples:
+      | partition_state |
+      | NY              |
+      | TX              |
+      | CA              |
+
+  Scenario: Parquet schema and data validation after backup
+    Given the backup script has completed successfully
+    When a schema inspection of one parquet file from the backup is performed
+    Then the parquet schema must match the source table schema exactly
+    And data values must match the source for all sampled records
+
+  Scenario: Compression validation on backup Parquet files
+    Given the backup files are created in the backup volume
+    When the file properties are checked
+    Then each Parquet file is compressed using Snappy codec
+
+  Scenario: Validation that all columns are included in the Parquet
+    Given the backup Parquet files are created
+    When the columns of the output files are inspected
+    Then all columns from "purgo_databricks.purgo_playground.customer_360_raw" are present in the backup files
+
+  Scenario: Handling of large datasets during backup
+    Given the source table contains more than 10 million records
+    When the backup script is run
+    Then the backup completes successfully without running out of storage or memory
+    And partitioning is used to optimize write performance
+
+  Scenario: Error when backup job does not have permission to read from source table
+    Given the backup job's user or service account lacks read permission on "purgo_databricks.purgo_playground.customer_360_raw"
+    When the backup job attempts to read from the table
+    Then the job fails with error message "Permission denied: Unable to read from source table purgo_databricks.purgo_playground.customer_360_raw."
+
+  Scenario: Error when backup job does not have permission to write to backup volume
+    Given the backup job's user or service account lacks write permission on "Volumes/customer_360_raw_backup"
+    When the backup job attempts to write files
+    Then the job fails with error message "Permission denied: Unable to write to backup volume Volumes/customer_360_raw_backup."
+
+  Scenario: Logging and auditability
+    Given the backup and vacuum operations are executed
+    Then operation logs must include timestamp, operation type (backup/vacuum), affected partitions, record counts, and any error messages
+
+  Scenario: Validation of vacuum grace period enforcement
+    Given the vacuum operation is invoked with a retention period of 30 days (720 hours)
+    When the vacuum is performed
+    Then no records with updated_at newer than (current_timestamp - interval 30 days) are deleted
+    And logs are created with details of number of records deleted and retained
