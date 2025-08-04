@@ -1,367 +1,129 @@
-# PySpark script for Databricks customer_360_raw backup and vacuum operation
-# Purpose: Generate comprehensive test data for customer_360_raw table and test backup/vacuum logic
-# Author: Giang Nguyen
-# Date: 2025-07-22
-# Description: This script generates diverse test data for the customer_360_raw table (including happy path, edge cases, errors, NULLs, and special characters), writes it as partitioned/parquet/snappy files, and runs an example of the vacuum logic, with robust commented documentation. All file I/O is safely handled, and all data types match Databricks conventions.
+# Test Data Generation for purgo_playground.customer_360_raw
+# PySpark code for Databricks
 
-# Imports for schema and PySpark DataFrame operations
+from pyspark.sql import SparkSession  # SparkSession is already available in Databricks
+from pyspark.sql.types import (  
+    StructType, StructField, LongType, StringType, DateType
+)
 from pyspark.sql import Row  
-from pyspark.sql.types import (
-    StructType, StructField, StringType, IntegerType, DoubleType, LongType, TimestampType, DateType
-)  # built-in
-from pyspark.sql import functions as F  
+from datetime import date, timedelta  
 
-import datetime  
-
-# Sample test data generation
-
-def get_sample_customer_360_raw_data():
-    """
-    Generate diverse test data for customer_360_raw table.
-    Covers happy path, edge, error, NULL, and special character scenarios.
-
-    Returns:
-        list of dict: Each dict is a test row.
-    """
-    now = datetime.datetime(2024, 6, 30, 12, 0, 0)
-    # Helper for timestamps
-    def ts(dt):
-        # Match Databricks timestamp standard: 'yyyy-MM-dd\'T\'HH:mm:ss.SSS+0000'
-        return dt.strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + '+0000'
-    # Basic test set
-    test_data = [
-        # Happy path, typical data
-        {
-            "customer_id": 1,  # BIGINT
-            "name": "Alice Smith",  # STRING
-            "email": "alice.smith@email.com",  # STRING
-            "state": "CA",  # STRING, partition col
-            "zip": "94105",  # STRING
-            "balance": 1050.75,  # DOUBLE
-            "credit_score": 720,  # INTEGER
-            "signup_date": "2021-01-15",  # STRING (could be DateType)
-            "last_purchase": ts(now - datetime.timedelta(days=1)),  # TIMESTAMP
-            "updated_at": "2024-06-29 18:00:00",  # STRING as source format
-        },
-        # Edge case: earliest allowed updated_at (boundary for vacuum)
-        {
-            "customer_id": 2,
-            "name": "Bob Zhang",
-            "email": "bob.zhang@email.com",
-            "state": "TX",
-            "zip": "73301",
-            "balance": 0.0,
-            "credit_score": 0,  # Minimum
-            "signup_date": "2022-12-31",
-            "last_purchase": ts(now - datetime.timedelta(days=30)),
-            "updated_at": "2024-05-31 12:00:00",  # Exactly 30 days ago
-        },
-        # Edge: future updated_at, high balance
-        {
-            "customer_id": 3,
-            "name": "Clara O’Hara",
-            "email": "clara.ohara@email.com",
-            "state": "NY",
-            "zip": "10001",
-            "balance": 1000000.99,
-            "credit_score": 850,  # Max in standard score
-            "signup_date": "2023-06-15",
-            "last_purchase": ts(now + datetime.timedelta(days=1)),  # in future
-            "updated_at": "2024-07-02 11:59:59",
-        },
-        # Edge: multi-byte char, special char, and NULL email
-        {
-            "customer_id": 4,
-            "name": "Nguyễn Văn ☺",
-            "email": None,
-            "state": "WA",
-            "zip": "98052",
-            "balance": 502.4,
-            "credit_score": 640,
-            "signup_date": "2022-08-05",
-            "last_purchase": ts(now - datetime.timedelta(hours=12)),
-            "updated_at": "2024-06-30 02:30:00",
-        },
-        # Error: Invalid credit_score / negative balance
-        {
-            "customer_id": 5,
-            "name": "Invalid User",
-            "email": "bad@example.com",
-            "state": "IL",
-            "zip": "60601",
-            "balance": -100.0,  # Out-of-range
-            "credit_score": -20,
-            "signup_date": "2020-05-12",
-            "last_purchase": ts(now - datetime.timedelta(days=60)),
-            "updated_at": "2024-05-10 09:00:00",  # Older than 30 days
-        },
-        # Error: invalid updated_at format
-        {
-            "customer_id": 6,
-            "name": "Mismatch Date",
-            "email": "mix@error.com",
-            "state": "NV",
-            "zip": "89501",
-            "balance": 300.50,
-            "credit_score": 600,
-            "signup_date": "2023-03-22",
-            "last_purchase": ts(now - datetime.timedelta(days=45)),
-            "updated_at": "2024/05/31T12:00Z",  # Bad format error test
-        },
-        # Error: NULL updated_at
-        {
-            "customer_id": 7,
-            "name": "Null Time",
-            "email": "nullerror@email.com",
-            "state": "FL",
-            "zip": "33101",
-            "balance": 80,
-            "credit_score": 450,
-            "signup_date": "2021-10-10",
-            "last_purchase": ts(now - datetime.timedelta(days=100)),
-            "updated_at": None,
-        },
-        # Edge: MAX values
-        {
-            "customer_id": 9223372036854775807,
-            "name": "Big Id",
-            "email": "maxid@big.com",
-            "state": "TX",
-            "zip": "79999",
-            "balance": 1.7976931348623157e+308,  # max double
-            "credit_score": 850,
-            "signup_date": "1900-01-01",
-            "last_purchase": ts(now),
-            "updated_at": "2024-06-30 12:00:00",
-        },
-        # Edge: unicode, emoji
-        {
-            "customer_id": 8,
-            "name": "Emoji 👩‍💻🦄",
-            "email": "emoji@fun.com",
-            "state": "HI",
-            "zip": "96801",
-            "balance": 2000,
-            "credit_score": 700,
-            "signup_date": "2022-11-23",
-            "last_purchase": ts(now),
-            "updated_at": "2024-06-30 06:30:00",
-        },
-        # Edge: blanks, special char in zip, weird state
-        {
-            "customer_id": 9,
-            "name": "",
-            "email": "",
-            "state": "ZZ",  # unknown/fake state
-            "zip": "!!!!!!",
-            "balance": 9.99,
-            "credit_score": 500,
-            "signup_date": "",
-            "last_purchase": ts(now - datetime.timedelta(days=2)),
-            "updated_at": "",  # blank string
-        },
-        # Happy path: another region
-        {
-            "customer_id": 10,
-            "name": "Juan Pérez",
-            "email": "juan.perez@correo.mx",
-            "state": "NM",
-            "zip": "87501",
-            "balance": 333.33,
-            "credit_score": 710,
-            "signup_date": "2024-01-01",
-            "last_purchase": ts(now - datetime.timedelta(days=20)),
-            "updated_at": "2024-06-15 08:30:20",
-        },
-        # Error: missing state (required partition col)
-        {
-            "customer_id": 11,
-            "name": "Missing State",
-            "email": "nostate@fail.com",
-            "state": None,
-            "zip": "00000",
-            "balance": 120,
-            "credit_score": 555,
-            "signup_date": "2022-02-02",
-            "last_purchase": ts(now),
-            "updated_at": "2024-06-10 17:00:00",
-        },
-        # Edge: special char in name (quotes, escapes)
-        {
-            "customer_id": 12,
-            "name": "O'Reilly \"The 3rd\"",
-            "email": "oreilly3@pub.com",
-            "state": "CA",
-            "zip": "90210",
-            "balance": 7200,
-            "credit_score": 710,
-            "signup_date": "2020-10-10",
-            "last_purchase": ts(now - datetime.timedelta(days=60)),
-            "updated_at": "2024-06-01 10:15:35",
-        },
-        # More happy/edge path rows...
-    ]
-    # Pad to at least 22 test records, with formulaic variants for further coverage:
-    base_states = ["CA", "TX", "NY", "WA"]
-    for i in range(13, 23):
-        test_data.append({
-            "customer_id": i,
-            "name": f"User {i}",
-            "email": f"test{i}@test.com",
-            "state": base_states[i % len(base_states)],
-            "zip": f"{90000 + i}",
-            "balance": 100.0 * (i % 5),
-            "credit_score": 700 + (i % 3) * 10,
-            "signup_date": f"2023-0{(i%9)+1}-01",
-            "last_purchase": ts(now - datetime.timedelta(days=i)),
-            "updated_at": (now - datetime.timedelta(days=i*2)).strftime('%Y-%m-%d %H:%M:%S'),
-        })
-    return test_data
-
-# Define customer_360_raw schema for Unity catalog consistency
-customer_360_raw_schema = StructType([
-    StructField("customer_id", LongType(), False),
+# Define schema matching purgo_playground.customer_360_raw
+customer_360_schema = StructType([
+    StructField("id", LongType(), True),
     StructField("name", StringType(), True),
     StructField("email", StringType(), True),
+    StructField("phone", StringType(), True),
+    StructField("company", StringType(), True),
+    StructField("job_title", StringType(), True),
+    StructField("address", StringType(), True),
+    StructField("city", StringType(), True),
     StructField("state", StringType(), True),
-    StructField("zip", StringType(), True),
-    StructField("balance", DoubleType(), True),
-    StructField("credit_score", IntegerType(), True),
-    StructField("signup_date", StringType(), True),  # Could be DateType but using STRING to match sample
-    StructField("last_purchase", StringType(), True),  # Store as string for cross-format test; could be TIMESTAMP
-    StructField("updated_at", StringType(), True),  # Important for backup/vacuum - time as STRING
+    StructField("country", StringType(), True),
+    StructField("industry", StringType(), True),
+    StructField("account_manager", StringType(), True),
+    StructField("creation_date", DateType(), True),
+    StructField("last_interaction_date", DateType(), True),
+    StructField("purchase_history", StringType(), True),
+    StructField("notes", StringType(), True),
+    StructField("zip", StringType(), True)
 ])
 
-def create_test_customer_360_raw_dataframe(spark):
-    """
-    Create DataFrame of test customer_360_raw data with proper schema.
+today = date(2024, 6, 30)
+thirty_days_ago = today - timedelta(days=30)
+ninety_days_ago = today - timedelta(days=90)
+one_year_ago = today - timedelta(days=365)
 
-    Args:
-        spark (SparkSession): Databricks SparkSession (provided).
+test_data = [
+    # Happy path: valid, typical record
+    Row(1, "Alice Smith", "alice.smith@example.com", "+1-555-1234", "Acme Corp", "Manager", "123 Main St", "San Francisco", "CA", "USA", "Technology", "John Doe", today, today, "Order#1234:2024-06-01", "VIP customer", "94105"),
+    # Happy path: another valid record, different state
+    Row(2, "Bob Lee", "bob.lee@example.com", "+1-555-5678", "Beta Inc", "Engineer", "456 Market St", "New York", "NY", "USA", "Finance", "Jane Roe", today, today, "Order#5678:2024-06-15", "Frequent buyer", "10001"),
+    # Happy path: valid, with multi-byte characters
+    Row(3, "李雷", "li.lei@example.cn", "+86-10-12345678", "北京科技", "开发工程师", "中关村大街1号", "北京", "BJ", "China", "科技", "王伟", today, today, "订单#8888:2024-06-20", "重要客户", "100080"),
+    # Happy path: valid, with special characters
+    Row(4, "O'Connor, Sean", "sean.o'connor@example.ie", "+353-1-2345678", "Dublin Tech", "CTO", "1 St. Patrick's Rd.", "Dublin", "D", "Ireland", "IT", "Mary O'Brien", today, today, "Order#9999:2024-06-25", "Loves ☘️", "D02X285"),
+    # Edge: creation_date exactly 30 days ago (should be retained after vacuum)
+    Row(5, "Carol Edge", "carol.edge@example.com", "+1-555-0000", "Edge Cases Ltd", "Analyst", "789 Edge St", "Austin", "TX", "USA", "Consulting", "Sam Edge", thirty_days_ago, today, "Order#0001:2024-05-31", "Boundary test", "73301"),
+    # Edge: creation_date just before 30 days ago (should be deleted after vacuum)
+    Row(6, "Dan Old", "dan.old@example.com", "+1-555-1111", "Old Data Inc", "Retired", "321 Old Rd", "Houston", "TX", "USA", "History", "Old Timer", thirty_days_ago - timedelta(days=1), today, "Order#0002:2024-05-30", "Should be vacuumed", "77001"),
+    # Edge: creation_date exactly today
+    Row(7, "Eve New", "eve.new@example.com", "+1-555-2222", "New Data LLC", "Intern", "654 New Ave", "Los Angeles", "CA", "USA", "Startups", "New Boss", today, today, "Order#0003:2024-06-30", "Brand new", "90001"),
+    # Edge: creation_date 1 year ago
+    Row(8, "Frank Year", "frank.year@example.com", "+1-555-3333", "Yearly Co", "Director", "987 Year Blvd", "Chicago", "IL", "USA", "Manufacturing", "Year Lead", one_year_ago, today, "Order#0004:2023-06-30", "Old record", "60601"),
+    # Error: invalid email format
+    Row(9, "Grace Error", "invalid-email-format", "+1-555-4444", "Error Inc", "Tester", "111 Bug St", "Seattle", "WA", "USA", "QA", "Error Handler", today, today, "Order#0005:2024-06-29", "Invalid email", "98101"),
+    # Error: NULL email (required field)
+    Row(10, "Hank Null", None, "+1-555-5555", "Nullables", "Consultant", "222 Null Rd", "Portland", "OR", "USA", "Consulting", "Null Boss", today, today, "Order#0006:2024-06-28", "Email is NULL", "97201"),
+    # Error: NULL id (required field)
+    Row(None, "Ivy NoID", "ivy.noid@example.com", "+1-555-6666", "NoID Corp", "Analyst", "333 NoID Ave", "Boston", "MA", "USA", "Analytics", "NoID Manager", today, today, "Order#0007:2024-06-27", "ID is NULL", "02101"),
+    # Error: NULL state (required field)
+    Row(12, "Jack NoState", "jack.nostate@example.com", "+1-555-7777", "NoState LLC", "Manager", "444 NoState Blvd", "Miami", None, "USA", "Tourism", "NoState Lead", today, today, "Order#0008:2024-06-26", "State is NULL", "33101"),
+    # NULL handling: NULL in non-required fields
+    Row(13, None, "kate.nullname@example.com", "+1-555-8888", "Null Name Inc", "Developer", None, "Denver", "CO", "USA", "Software", "Null Name Boss", today, today, "Order#0009:2024-06-25", None, "80201"),
+    # Special characters: emoji in notes
+    Row(14, "Leo Emoji", "leo.emoji@example.com", "+1-555-9999", "Emoji Corp", "Designer", "555 Emoji St", "Orlando", "FL", "USA", "Design", "Emoji Lead", today, today, "Order#0010:2024-06-24", "Loves 🦄🚀", "32801"),
+    # Special characters: multi-byte in company
+    Row(15, "Miyuki 山田", "miyuki.yamada@example.jp", "+81-3-1234-5678", "株式会社サンプル", "営業", "東京都千代田区1-1-1", "東京", "TK", "Japan", "商社", "田中", today, today, "注文#123:2024-06-23", "日本語テスト", "100-0001"),
+    # Edge: zip with special chars
+    Row(16, "Nina Zip", "nina.zip@example.com", "+1-555-1010", "Zip Testers", "QA", "666 Zip Rd", "Phoenix", "AZ", "USA", "Testing", "Zip Boss", today, today, "Order#0011:2024-06-22", "Zip test", "85-001"),
+    # Edge: phone with special chars
+    Row(17, "Oscar Phone", "oscar.phone@example.com", "(555) 202-2020 ext.123", "Phone Co", "Support", "777 Phone St", "Dallas", "TX", "USA", "Telecom", "Phone Lead", today, today, "Order#0012:2024-06-21", "Phone test", "75201"),
+    # Edge: purchase_history with JSON string
+    Row(18, "Paula JSON", "paula.json@example.com", "+1-555-3030", "JSON Inc", "Data Scientist", "888 JSON Ave", "San Jose", "CA", "USA", "Data", "JSON Boss", today, today, '{"orders":[{"id":1,"date":"2024-06-20"}]}', "JSON in purchase_history", "95101"),
+    # Edge: notes with SQL injection attempt
+    Row(19, "Quinn SQL", "quinn.sql@example.com", "+1-555-4040", "SQLi Corp", "DBA", "999 SQL Blvd", "Austin", "TX", "USA", "Security", "SQL Lead", today, today, "Order#0013:2024-06-20", "Robert'); DROP TABLE Students;--", "73301"),
+    # Edge: all fields NULL except id, email, state, creation_date
+    Row(20, 20, "rachel.nulls@example.com", None, None, None, None, None, "CA", None, None, None, today, None, None, None, None),
+    # Edge: all fields NULL except id, email, state, creation_date, last_interaction_date
+    Row(21, 21, "sam.nulls@example.com", None, None, None, None, None, "NY", None, None, None, today, today, None, None, None),
+    # Edge: all fields NULL except id, email, state, creation_date, last_interaction_date, purchase_history
+    Row(22, 22, "tom.nulls@example.com", None, None, None, None, None, "TX", None, None, None, today, today, "Order#0014:2024-06-19", None, None),
+    # Edge: all fields NULL except id, email, state, creation_date, last_interaction_date, purchase_history, notes
+    Row(23, 23, "uma.nulls@example.com", None, None, None, None, None, "FL", None, None, None, today, today, "Order#0015:2024-06-18", "Only notes", None),
+    # Edge: all fields NULL except id, email, state, creation_date, last_interaction_date, purchase_history, notes, zip
+    Row(24, 24, "vic.nulls@example.com", None, None, None, None, None, "IL", None, None, None, today, today, "Order#0016:2024-06-17", "Only notes and zip", "60601"),
+    # Edge: id at max bigint value
+    Row(9223372036854775807, "Max BigInt", "max.bigint@example.com", "+1-555-5050", "BigInt Co", "Lead", "1000 BigInt St", "Houston", "TX", "USA", "Data", "BigInt Boss", today, today, "Order#0017:2024-06-16", "Max id", "77001"),
+    # Edge: id at min bigint value
+    Row(-9223372036854775808, "Min BigInt", "min.bigint@example.com", "+1-555-6060", "BigInt Co", "Lead", "1001 BigInt St", "Houston", "TX", "USA", "Data", "BigInt Boss", today, today, "Order#0018:2024-06-15", "Min id", "77001"),
+    # Edge: name with special unicode
+    Row(25, "Zoë 🌟", "zoe.star@example.com", "+1-555-7070", "Unicode Inc", "Artist", "200 Unicode Rd", "San Diego", "CA", "USA", "Arts", "Unicode Lead", today, today, "Order#0019:2024-06-14", "Unicode in name", "92101"),
+    # Edge: company with newline/tab
+    Row(26, "Yuri Tab", "yuri.tab@example.com", "+1-555-8080", "Tab\nCorp\tLtd", "Tabber", "300 Tab St", "San Jose", "CA", "USA", "Tech", "Tab Lead", today, today, "Order#0020:2024-06-13", "Tab/newline in company", "95101"),
+    # Edge: notes with long string (max length test)
+    Row(27, "Wendy Long", "wendy.long@example.com", "+1-555-9090", "LongText Inc", "Writer", "400 Long St", "San Francisco", "CA", "USA", "Publishing", "Long Lead", today, today, "Order#0021:2024-06-12", "A"*1000, "94105"),
+    # Edge: purchase_history with special chars
+    Row(28, "Xander Special", "xander.special@example.com", "+1-555-1112", "Specials", "Specialist", "500 Special St", "Austin", "TX", "USA", "Special", "Special Lead", today, today, "Order#0022:2024-06-11;DROP TABLE", "Special chars in purchase_history", "73301"),
+    # Edge: zip with unicode
+    Row(29, "Yasmin Unicode", "yasmin.unicode@example.com", "+1-555-1313", "UnicodeZip", "Manager", "600 Unicode St", "Miami", "FL", "USA", "Retail", "Unicode Lead", today, today, "Order#0023:2024-06-10", "Unicode zip", "〒123-4567"),
+    # Edge: all fields NULL (should be rejected by validation)
+    Row(None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None)
+]
 
-    Returns:
-        DataFrame: Test data as per customer_360_raw_schema.
-    """
-    sample = get_sample_customer_360_raw_data()
-    rows = [Row(**row) for row in sample]
-    df = spark.createDataFrame(rows, schema=customer_360_raw_schema)
-    return df
+# Create DataFrame
+df_customer_360 = spark.createDataFrame(test_data, schema=customer_360_schema)
 
-# Create sample test DataFrame (simulate loading from Unity catalog)
-customer_360_raw_test_df = create_test_customer_360_raw_dataframe(spark)
+# Show the test data (for validation)
+df_customer_360.show(truncate=False)
 
-# Sample backup Parquet write (partitioned by 'state', compressed by snappy)
-try:
-    # Run backup, with all required options
-    customer_360_raw_test_df.write.mode("overwrite") \
-        .partitionBy("state") \
-        .option("compression", "snappy") \
-        .parquet("/Volumes/customer_360_raw_backup")
-    print("Backup completed successfully.")
-except Exception as e:
-    print(f"Backup error: {e}")
+# Comments for test scenarios:
+# 1-4: Happy path, valid data, including multi-byte and special characters
+# 5-8: Edge cases for creation_date (boundary for vacuum), old/new records
+# 9: Error case, invalid email format
+# 10: Error case, NULL email (required)
+# 11: Error case, NULL id (required)
+# 12: Error case, NULL state (required)
+# 13: NULL in non-required fields
+# 14-15: Special/multi-byte characters in notes/company
+# 16-17: Special chars in zip/phone
+# 18: JSON string in purchase_history
+# 19: SQL injection attempt in notes
+# 20-24: Various levels of NULLs, edge for required fields
+# 25-26: Max/min bigint, unicode in name/company
+# 27: Long string in notes
+# 28: Special chars in purchase_history
+# 29: Unicode in zip
+# 30: All fields NULL (should be rejected by validation)
 
-# -- Validation: Check that Parquet output rowcount matches input (simulate partition validation)
-try:
-    backup_df = spark.read.parquet("/Volumes/customer_360_raw_backup")
-    source_count = customer_360_raw_test_df.count()
-    backup_count = backup_df.count()
-    assert backup_count == source_count, f"Row count mismatch: source={source_count}, backup={backup_count}"
-    print("Validation passed: row counts match.")
-except Exception as e:
-    print(f"Backup validation error: {e}")
-
-def vacuum_customer_360_raw_table(retention_days=30):
-    """
-    Simulate a vacuum (delete) operation to remove records older than given retention.
-
-    Args:
-        retention_days (int): Retain only records updated in last `retention_days`.
-
-    Returns:
-        DataFrame: Filtered DataFrame retaining only recent records.
-    """
-    # Keep rows with valid updated_at only, and in correct format
-    cutoff = datetime.datetime(2024, 6, 30, 12, 0, 0) - datetime.timedelta(days=retention_days)
-    cutoff_str = cutoff.strftime('%Y-%m-%d %H:%M:%S')
-    df = customer_360_raw_test_df.withColumn(
-        "updated_at_ts",
-        F.to_timestamp("updated_at", "yyyy-MM-dd HH:mm:ss")
-    )
-    # filter: updated_at >= cutoff
-    filtered = df.filter(
-        (F.col("updated_at_ts").isNotNull()) &
-        (F.col("updated_at_ts") >= F.lit(cutoff_str))
-    )
-    return filtered
-
-# -- Run vacuum simulation: delete records older than 2024-05-31 12:00:00
-old_count = customer_360_raw_test_df.count()
-vacuumed_df = vacuum_customer_360_raw_table(retention_days=30)
-remaining_count = vacuumed_df.count()
-print(f"Vacuum simulated: {old_count-remaining_count} records would be deleted; {remaining_count} remain.")
-
-# -- Edge case: test error handling for partition column missing
-def test_missing_partition_column():
-    """
-    Test backup error when partition column 'state' is missing.
-
-    Raises:
-        Exception: To simulate PARTITION_COLUMN_MISSING error.
-    """
-    temp_schema = StructType([f for f in customer_360_raw_schema if f.name != "state"])
-    temp_df = spark.createDataFrame(
-        customer_360_raw_test_df.drop("state").rdd, schema=temp_schema
-    )
-    try:
-        temp_df.write.partitionBy("state").parquet("/Volumes/customer_360_raw_backup_error")
-    except Exception as e:
-        print(f"Expected error when partitionBy column missing: {e}")
-
-# -- Uncomment to test missing partition column error scenario
-# test_missing_partition_column()
-
-# -- Edge case: test error handling for bad updated_at format during vacuum
-def test_bad_updated_at_format_vacuum():
-    """
-    Test vacuum error when 'updated_at' has illegal format.
-
-    Raises:
-        ValueError: On format parsing error.
-    """
-    # Simulate
-    try:
-        df = customer_360_raw_test_df.withColumn(
-            "updated_at_ts",
-            F.to_timestamp("updated_at", "yyyy-MM-dd HH:mm:ss")
-        )
-        bad_df = df.filter(
-            F.col("updated_at_ts").isNull() & (F.col("updated_at").isNotNull())
-        )
-        bad_rows = bad_df.select("customer_id", "updated_at").collect()
-        if bad_rows:
-            raise ValueError("INVALID_DATETIME_FORMAT: 'updated_at' is not yyyy-MM-dd HH:mm:ss")
-        print("All 'updated_at' values are valid.")
-    except Exception as e:
-        print(f"Vacuum format error: {e}")
-
-# -- Run validation for format error
-test_bad_updated_at_format_vacuum()
-
-# -- NULL updated_at error test for vacuum
-def test_null_updated_at_vacuum():
-    """
-    Test vacuum error when 'updated_at' is NULL.
-
-    Raises:
-        Exception: On NULL found in 'updated_at'.
-    """
-    try:
-        null_rows = customer_360_raw_test_df.filter(F.col("updated_at").isNull()).count()
-        if null_rows > 0:
-            raise Exception("NULL_DATETIME_ERROR: 'updated_at' field is null")
-        print("No NULL 'updated_at' field found.")
-    except Exception as e:
-        print(f"Vacuum NULL error: {e}")
-
-test_null_updated_at_vacuum()
+# Note: Do not include spark.stop() in Databricks notebooks
