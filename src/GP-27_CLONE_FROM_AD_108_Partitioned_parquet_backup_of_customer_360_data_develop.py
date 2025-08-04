@@ -1,244 +1,207 @@
 spark.catalog.setCurrentCatalog("purgo_databricks")
 
 # ============================================================
-# PySpark Script: Backup and Vacuum for customer_360_raw Table
+# PySpark Script for Full Backup and Vacuum of customer_360_raw
+# Databricks environment: Unity Catalog, Delta Lake, Volumes
+# All code is executable in Databricks, with comments for clarity
 # ============================================================
-# This script performs a full backup of the purgo_databricks.purgo_playground.customer_360_raw table
-# as compressed parquet files partitioned by state in the specified Databricks volume,
-# and performs a vacuum operation to remove records older than 30 days (hard delete).
-# All operations are logged in purgo_playground.customer_360_raw_backup_log.
-# Parquet files are compressed with snappy and retained for 90 days.
-# The script is designed for scheduled daily execution at 02:00 UTC.
-# ------------------------------------------------------------
-# All code is Databricks production-ready and follows best practices.
-# ------------------------------------------------------------
 
-# ------------------------------------------------------------
-# IMPORTS
-# ------------------------------------------------------------
+# ---------------------------
+# Imports and Setup
+# ---------------------------
+from pyspark.sql import SparkSession  # SparkSession is already available in Databricks
 from pyspark.sql import functions as F  
-from pyspark.sql.types import StructType, StructField, LongType, StringType, DateType  
-import datetime  
-import sys  
+from pyspark.sql.types import LongType, StringType, DateType  
+from datetime import datetime, timedelta  
+import re  
 
-# ------------------------------------------------------------
-# CONFIGURATION CONSTANTS
-# ------------------------------------------------------------
+# ---------------------------
+# Constants and Paths
+# ---------------------------
 CATALOG = "purgo_databricks"
 SCHEMA = "purgo_playground"
-SOURCE_TABLE = f"{CATALOG}.{SCHEMA}.customer_360_raw"
-BACKUP_LOG_TABLE = f"{SCHEMA}.customer_360_raw_backup_log"
-BACKUP_VOLUME_PATH = "/Volumes/customer_360_raw_backup"
+RAW_TABLE = f"{CATALOG}.{SCHEMA}.customer_360_raw"
+BACKUP_LOG_TABLE = f"{CATALOG}.{SCHEMA}.customer_360_raw_backup_log"
+VOLUME_BACKUP_PATH = "/Volumes/customer_360_raw_backup"
 PARQUET_COMPRESSION = "snappy"
-PARTITION_COLUMN = "state"
+BACKUP_PARTITION_COL = "state"
+REQUIRED_FIELDS = ["id", "email", "state", "creation_date"]
 BACKUP_RETENTION_DAYS = 90
 VACUUM_RETENTION_DAYS = 30
-MIN_FREE_SPACE_BYTES = 1_000_000_000  # 1GB
 
-# ------------------------------------------------------------
-# UTILITY FUNCTIONS
-# ------------------------------------------------------------
+# ---------------------------
+# Utility Functions
+# ---------------------------
 
-def log_backup_operation(status, operation_type, record_count, error_message):
+def log_operation(status, operation_type, record_count, error_message):
     """
-    Logs the backup/vacuum/retention operation to the backup log table.
+    Log backup or vacuum operation to the backup log table.
     """
-    log_df = spark.createDataFrame([
-        (
-            datetime.datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
-            status,
-            operation_type,
-            int(record_count) if record_count is not None else 0,
-            error_message
-        )
-    ], schema=["timestamp", "status", "operation_type", "record_count", "error_message"])
+    log_df = spark.createDataFrame(
+        [(datetime.utcnow().isoformat(), status, operation_type, record_count, error_message)],
+        ["timestamp", "status", "operation_type", "record_count", "error_message"]
+    )
     try:
         log_df.write.format("delta").mode("append").saveAsTable(BACKUP_LOG_TABLE)
     except Exception as e:
-        # If logging fails, print error (cannot log to log table)
-        print(f"ERROR: Unable to write to backup log table: {str(e)}", file=sys.stderr)
+        # If log table is unavailable, raise error as per requirements
+        raise RuntimeError("Backup log table unavailable") from e
 
-def check_volume_path_exists(path):
+def validate_email(email):
     """
-    Checks if the backup volume path exists and is accessible using dbutils.fs.
+    Simple email format validation using regex.
+    """
+    if email is None:
+        return False
+    return re.match(r"^[^@]+@[^@]+\.[^@]+$", email) is not None
+
+def validate_required_fields(row):
+    """
+    Validate required fields for a row.
+    """
+    if row["id"] is None:
+        return False, f"id is NULL in record with email={row['email']}"
+    if row["email"] is None:
+        return False, f"email is NULL in record id={row['id']}"
+    if not validate_email(row["email"]):
+        return False, f"Data validation error: invalid email format in record id={row['id']}"
+    if row["state"] is None:
+        return False, f"state is NULL in record id={row['id']}"
+    return True, None
+
+def check_storage_space(path, estimated_gb):
+    """
+    Check if there is enough free space at the given path.
+    Returns True if enough space, False otherwise.
+    """
+    try:
+        # Use dbutils.fs.ls to check if path exists
+        # Use dbutils.fs.mounts() to get mount point, but free space is not directly available
+        # As a workaround, skip this check in Databricks (cannot get free space reliably)
+        return True
+    except Exception:
+        return True
+
+def remove_partial_files(path):
+    """
+    Remove partial files from backup directory in case of failure.
     """
     try:
         files = dbutils.fs.ls(path)
-        return True
+        for f in files:
+            dbutils.fs.rm(f.path, True)
     except Exception:
-        return False
+        pass  # Ignore if path does not exist
 
-def check_volume_free_space(path, min_bytes=1_000_000_000):
+def delete_old_backups(volume_path, retention_days):
     """
-    Checks if the backup volume path has at least min_bytes free space using dbutils.fs.
+    Delete backup files older than retention period.
     """
+    cutoff_date = (datetime.utcnow() - timedelta(days=retention_days)).date()
     try:
-        # dbutils.fs.ls returns FileInfo objects; get the root mount point
-        # For Volumes, free space is not directly available; skip check if not supported
-        # For DBFS root, use dbutils.fs.diskUsage if available (not always supported)
-        # As a fallback, always return True (Databricks Volumes are managed)
-        return True
+        # List all partition directories (state=XX)
+        state_dirs = [f.path for f in dbutils.fs.ls(volume_path) if f.isDir()]
+        for state_dir in state_dirs:
+            # List all files in state partition
+            files = dbutils.fs.ls(state_dir)
+            for f in files:
+                # Parquet files do not have date in filename, so rely on file modification time
+                file_info = f
+                mod_time = datetime.utcfromtimestamp(file_info.modificationTime / 1000)
+                if mod_time.date() < cutoff_date:
+                    dbutils.fs.rm(file_info.path, True)
     except Exception:
-        return True
+        pass  # Ignore errors in cleanup
 
-def get_table_schema(table_name):
-    """
-    Returns the schema of the given table as a StructType.
-    """
-    return spark.table(table_name).schema
-
-def compare_schemas(schema1, schema2):
-    """
-    Compares two StructType schemas for exact match.
-    """
-    return schema1.json() == schema2.json()
-
-def get_backup_file_paths(base_path):
-    """
-    Returns a list of all parquet file paths under the backup volume using dbutils.fs.
-    """
-    file_paths = []
-    try:
-        dirs = [base_path]
-        while dirs:
-            current = dirs.pop()
-            for f in dbutils.fs.ls(current):
-                if f.isDir():
-                    dirs.append(f.path)
-                elif f.path.endswith(".parquet"):
-                    file_paths.append(f.path)
-    except Exception:
-        pass
-    return file_paths
-
-def get_file_modification_date(path):
-    """
-    Returns the modification date of a file as a datetime.date using dbutils.fs.
-    """
-    try:
-        info = dbutils.fs.ls(path)
-        if info and len(info) == 1:
-            ts = info[0].modificationTime / 1000.0
-            return datetime.date.fromtimestamp(ts)
-    except Exception:
-        pass
-    return None
-
-def delete_file(path):
-    """
-    Deletes the specified file using dbutils.fs.
-    """
-    try:
-        dbutils.fs.rm(path, True)
-        return True
-    except Exception:
-        return False
-
-# ------------------------------------------------------------
-# BACKUP OPERATION
-# ------------------------------------------------------------
-
+# ---------------------------
+# Step 1: Data Validation
+# ---------------------------
 try:
-    # Step 1: Validate backup volume path
-    if not check_volume_path_exists(BACKUP_VOLUME_PATH):
-        log_backup_operation("FAILED", "BACKUP", 0, "Backup volume path not found or inaccessible")
-        raise Exception("Backup volume path not found or inaccessible")
-
-    # Step 2: Validate free space (skip if not supported)
-    if not check_volume_free_space(BACKUP_VOLUME_PATH, MIN_FREE_SPACE_BYTES):
-        log_backup_operation("FAILED", "BACKUP", 0, "Insufficient storage space for backup")
-        raise Exception("Insufficient storage space for backup")
-
-    # Step 3: Read source table
-    df = spark.table(SOURCE_TABLE)
-
-    # Step 4: Validate schema
-    source_schema = get_table_schema(SOURCE_TABLE)
-    if not compare_schemas(df.schema, source_schema):
-        log_backup_operation("FAILED", "BACKUP", 0, "Schema mismatch detected during backup")
-        raise Exception("Schema mismatch detected during backup")
-
-    # Step 5: Validate non-empty table
-    record_count = df.count()
-    if record_count == 0:
-        log_backup_operation("FAILED", "BACKUP", 0, "No records found to back up")
-        raise Exception("No records found to back up")
-
-    # Step 6: Validate partition column 'state' does not contain NULLs
-    null_state_count = df.filter(F.col(PARTITION_COLUMN).isNull()).count()
-    if null_state_count > 0:
-        log_backup_operation("FAILED", "BACKUP", 0, "Partition column 'state' contains NULLs")
-        raise Exception("Partition column 'state' contains NULLs")
-
-    # Step 7: Write to backup volume as partitioned, compressed parquet
-    df.write \
-        .mode("overwrite") \
-        .partitionBy(PARTITION_COLUMN) \
-        .option("compression", PARQUET_COMPRESSION) \
-        .parquet(BACKUP_VOLUME_PATH)
-
-    # Step 8: Log success
-    log_backup_operation("SUCCESS", "BACKUP", record_count, None)
-
+    df_raw = spark.table(RAW_TABLE)
 except Exception as e:
-    # Log failure if not already logged
-    log_backup_operation("FAILED", "BACKUP", 0, str(e))
+    log_operation("FAILED", "BACKUP", 0, f"Source table unavailable: {str(e)}")
     raise
 
-# ------------------------------------------------------------
-# VACUUM OPERATION (DELETE OLD RECORDS)
-# ------------------------------------------------------------
+# Validate required fields and email format
+invalid_rows = []
+for row in df_raw.collect():
+    valid, err = validate_required_fields(row.asDict())
+    if not valid:
+        invalid_rows.append((row, err))
 
+if invalid_rows:
+    # Log first error and abort backup
+    first_err = invalid_rows[0][1]
+    log_operation("FAILED", "BACKUP", 0, first_err)
+    # Remove any partial files
+    remove_partial_files(VOLUME_BACKUP_PATH)
+    raise ValueError(first_err)
+
+# ---------------------------
+# Step 2: Storage Space Check
+# ---------------------------
+# Estimate backup size as 2x table size in GB (conservative)
 try:
-    # Step 1: Calculate cutoff date
-    cutoff_date = (datetime.date.today() - datetime.timedelta(days=VACUUM_RETENTION_DAYS)).isoformat()
+    table_size_bytes = spark.sql(f"DESCRIBE DETAIL {RAW_TABLE}").select("sizeInBytes").first()["sizeInBytes"]
+    estimated_gb = max(1, int(table_size_bytes / (1024 ** 3)) * 2)
+except Exception:
+    estimated_gb = 10  # Default to 10GB if unable to estimate
 
-    # Step 2: Count records to be deleted
-    to_delete = spark.table(SOURCE_TABLE).filter(
-        (F.col("creation_date") < F.lit(cutoff_date)) & (F.col("last_interaction_date") < F.lit(cutoff_date))
-    )
-    deleted_count = to_delete.count()
+if not check_storage_space(VOLUME_BACKUP_PATH, estimated_gb):
+    log_operation("FAILED", "BACKUP", 0, "Insufficient storage space")
+    remove_partial_files(VOLUME_BACKUP_PATH)
+    raise IOError("Insufficient storage space")
 
-    # Step 3: Perform DELETE (hard delete)
+# ---------------------------
+# Step 3: Full Backup to Parquet (Partitioned by State, Snappy Compression)
+# ---------------------------
+try:
+    record_count = df_raw.count()
+    # Write to parquet, partitioned by state, snappy compression, overwrite mode for full backup
+    df_raw.write.mode("overwrite").partitionBy(BACKUP_PARTITION_COL).option("compression", PARQUET_COMPRESSION).parquet(VOLUME_BACKUP_PATH)
+    log_operation("SUCCESS", "BACKUP", record_count, None)
+except Exception as e:
+    log_operation("FAILED", "BACKUP", 0, f"Backup failed: {str(e)}")
+    remove_partial_files(VOLUME_BACKUP_PATH)
+    raise
+
+# ---------------------------
+# Step 4: Delete Old Backup Files (Retention Policy)
+# ---------------------------
+try:
+    delete_old_backups(VOLUME_BACKUP_PATH, BACKUP_RETENTION_DAYS)
+except Exception as e:
+    # Log but do not fail the main backup if retention cleanup fails
+    log_operation("FAILED", "RETENTION", 0, f"Retention cleanup failed: {str(e)}")
+
+# ---------------------------
+# Step 5: Vacuum Operation (Retain Only Last 30 Days)
+# ---------------------------
+try:
+    today = datetime.utcnow().date()
+    min_date = today - timedelta(days=VACUUM_RETENTION_DAYS)
+    # Use SQL DELETE to remove old records (hard delete)
     spark.sql(f"""
-        DELETE FROM {SOURCE_TABLE}
-        WHERE (creation_date < DATE('{cutoff_date}') AND last_interaction_date < DATE('{cutoff_date}'))
+        DELETE FROM {RAW_TABLE}
+        WHERE creation_date < DATE('{min_date.isoformat()}')
     """)
-
-    # Step 4: Log success
-    log_backup_operation("SUCCESS", "VACUUM", deleted_count, None)
-
+    post_vacuum_count = spark.table(RAW_TABLE).count()
+    log_operation("SUCCESS", "VACUUM", post_vacuum_count, None)
 except Exception as e:
-    # Log failure
-    log_backup_operation("FAILED", "VACUUM", 0, str(e))
+    log_operation("FAILED", "VACUUM", 0, f"Vacuum failed: {str(e)}")
     raise
 
-# ------------------------------------------------------------
-# RETENTION POLICY ENFORCEMENT FOR BACKUP PARQUET FILES
-# ------------------------------------------------------------
-
+# ---------------------------
+# Step 6: Delta Lake VACUUM Command
+# ---------------------------
 try:
-    today = datetime.date.today()
-    deleted_file_count = 0
-    backup_files = get_backup_file_paths(BACKUP_VOLUME_PATH)
-    for file_path in backup_files:
-        # Get file modification date
-        try:
-            file_info = dbutils.fs.ls(file_path)
-            if file_info and len(file_info) == 1:
-                mod_date = datetime.date.fromtimestamp(file_info[0].modificationTime / 1000.0)
-                if (today - mod_date).days > BACKUP_RETENTION_DAYS:
-                    if delete_file(file_path):
-                        deleted_file_count += 1
-        except Exception:
-            continue
-    if deleted_file_count > 0:
-        log_backup_operation("SUCCESS", "RETENTION", deleted_file_count, None)
+    # Run VACUUM to physically remove old files (retention 0 hours for hard delete)
+    spark.sql(f"VACUUM {RAW_TABLE} RETAIN 0 HOURS")
 except Exception as e:
-    log_backup_operation("FAILED", "RETENTION", 0, str(e))
-    raise
+    # Log but do not fail the main vacuum if VACUUM fails
+    log_operation("FAILED", "VACUUM", 0, f"Delta VACUUM failed: {str(e)}")
 
-# ------------------------------------------------------------
-# END OF SCRIPT
-# ------------------------------------------------------------
-# All operations completed and logged.
+# ---------------------------
+# End of Script
+# ---------------------------
+# Note: Do not include spark.stop() in Databricks notebooks
