@@ -1,97 +1,160 @@
-Feature: Backup and Vacuum Operations on customer_360_raw Table in Databricks
+Feature: Backup and Vacuum Operations for customer_360_raw Table
 
-  As a Data Engineer,
-  I want to develop a PySpark script to efficiently backup the 'customer_360_raw' Unity Catalog table as compressed, partitioned Parquet files
-  and perform a vacuum operation to remove records older than 30 days,
-  So that data is safely archived without excessive storage usage and compliance with data retention policy is maintained.
+  The system must efficiently back up the purgo_databricks.purgo_playground.customer_360_raw table as compressed parquet files partitioned by state, and perform a vacuum operation to retain only records from the last 30 days. All operations must be logged in purgo_playground.customer_360_raw_backup_log.
 
   Background:
-    Given the Unity Catalog table "purgo_databricks.purgo_playground.customer_360_raw" is available
-    And the backup volume path is "/Volumes/customer_360_raw_backup"
-    And the backup format is "Parquet" with "snappy" compression
-    And the required partition column is "state" (assumed to be present in the table schema)
-    And the field "updated_at" in the table contains timestamps in "yyyy-MM-dd HH:mm:ss" format
-    And the script will backup all columns from the source table
-    And the current UTC time is "2024-06-30 12:00:00"
+    Given the source table is purgo_databricks.purgo_playground.customer_360_raw
+    And the backup parquet files must be stored in the Databricks volume at path "/Volumes/customer_360_raw_backup"
+    And the parquet files must use "snappy" compression codec
+    And all columns from the source table must be included in the backup
+    And the backup must be a full backup (all records)
+    And the backup operation must precede the vacuum operation
+    And the vacuum operation must be a hard delete, permanently removing old records
+    And the backup and vacuum operations must be performed daily at 02:00 UTC
+    And backup parquet files must be retained for 90 days in the volume
+    And the script must have read access to purgo_playground.customer_360_raw and write access to /Volumes/customer_360_raw_backup
+    And all operations must be logged in purgo_playground.customer_360_raw_backup_log with timestamp, status, operation_type, record_count, and error_message
 
-  Scenario: Successful backup of customer_360_raw table partitioned by state as compressed Parquet
-    Given the Databricks compute cluster is running and PySpark environment is available
-    And the service account has "read" access on "purgo_databricks.purgo_playground.customer_360_raw"
-    And the service account has "write" access to "/Volumes/customer_360_raw_backup"
-    When the PySpark script reads the entire "purgo_databricks.purgo_playground.customer_360_raw" table
-    And the script writes the data as Parquet files to "/Volumes/customer_360_raw_backup" using "snappy" compression
-    And the script partitions the output files by the "state" column
-    Then the "/Volumes/customer_360_raw_backup" should contain Parquet files partitioned by each unique state value present in the table
-    And all columns from the source table must be present in each Parquet file
-    And each Parquet file must be compressed using "snappy"
-    And no exception should be raised during the operation
+  Scenario: Successful full backup of customer_360_raw table to compressed parquet files partitioned by state
+    Given the purgo_playground.customer_360_raw table contains 100,000 records
+    When the backup operation is triggered
+    Then all 100,000 records are written to "/Volumes/customer_360_raw_backup" as parquet files
+    And the parquet files are partitioned by the "state" column
+    And the parquet files are compressed using "snappy"
+    And the backup log table purgo_playground.customer_360_raw_backup_log contains a record with
+      | status  | operation_type | record_count | error_message |
+      | SUCCESS | BACKUP        | 100000       | NULL          |
 
-  Scenario Outline: Error during backup due to insufficient permissions
-    Given the Databricks compute cluster is running and PySpark environment is available
-    And the service account has "<read_permission>" access on "purgo_databricks.purgo_playground.customer_360_raw"
-    And the service account has "<write_permission>" access to "/Volumes/customer_360_raw_backup"
-    When the PySpark script attempts to write as Parquet to the backup volume
-    Then a "<error_message>" error should be raised
+  Scenario: Successful vacuum operation retains only records from the last 30 days
+    Given the purgo_playground.customer_360_raw table contains records with creation_date ranging from 2024-03-01 to 2024-06-30
+    And today is 2024-06-30
+    When the vacuum operation is triggered
+    Then only records with creation_date >= 2024-05-31 are retained in purgo_playground.customer_360_raw
+    And all records with creation_date < 2024-05-31 are permanently deleted
+    And the backup log table purgo_playground.customer_360_raw_backup_log contains a record with
+      | status  | operation_type | record_count | error_message |
+      | SUCCESS | VACUUM        | <remaining>  | NULL          |
 
+  Scenario: Backup operation fails due to insufficient write permissions
+    Given the script does not have write access to "/Volumes/customer_360_raw_backup"
+    When the backup operation is triggered
+    Then no parquet files are written
+    And the backup log table purgo_playground.customer_360_raw_backup_log contains a record with
+      | status  | operation_type | record_count | error_message                      |
+      | FAILED  | BACKUP         | 0            | "Permission denied: write access"  |
+
+  Scenario: Vacuum operation fails due to insufficient table permissions
+    Given the script does not have delete permissions on purgo_playground.customer_360_raw
+    When the vacuum operation is triggered
+    Then no records are deleted from purgo_playground.customer_360_raw
+    And the backup log table purgo_playground.customer_360_raw_backup_log contains a record with
+      | status  | operation_type | record_count | error_message                      |
+      | FAILED  | VACUUM         | 0            | "Permission denied: delete access" |
+
+  Scenario: Backup operation fails due to storage quota exceeded
+    Given the Databricks volume "/Volumes/customer_360_raw_backup" has less than 1GB free space
+    And the backup size is estimated to be 10GB
+    When the backup operation is triggered
+    Then no parquet files are written
+    And the backup log table purgo_playground.customer_360_raw_backup_log contains a record with
+      | status  | operation_type | record_count | error_message                |
+      | FAILED  | BACKUP         | 0            | "Insufficient storage space" |
+
+  Scenario: Backup operation fails due to data validation error (invalid email format)
+    Given the purgo_playground.customer_360_raw table contains a record with email = "invalid-email-format"
+    When the backup operation is triggered
+    Then the backup operation is aborted
+    And the backup log table purgo_playground.customer_360_raw_backup_log contains a record with
+      | status  | operation_type | record_count | error_message                        |
+      | FAILED  | BACKUP         | 0            | "Data validation error: invalid email format in record id=<id>" |
+
+  Scenario Outline: Data validation for required fields before backup
+    Given the purgo_playground.customer_360_raw table contains a record with <column> = <invalid_value>
+    When the backup operation is triggered
+    Then the backup operation is aborted
+    And the backup log table purgo_playground.customer_360_raw_backup_log contains a record with
+      | status  | operation_type | record_count | error_message                        |
+      | FAILED  | BACKUP         | 0            | "Data validation error: <error_msg>" |
     Examples:
-      | read_permission | write_permission | error_message                                     |
-      | read           | none             | ACCESS_DENIED: No WRITE privilege on backup volume |
-      | none           | write            | ACCESS_DENIED: No READ privilege on source table   |
-      | none           | none             | ACCESS_DENIED: No READ or WRITE privileges         |
+      | column     | invalid_value | error_msg                                 |
+      | email      | NULL          | email is NULL in record id=<id>           |
+      | id         | NULL          | id is NULL in record with email=<email>   |
+      | state      | NULL          | state is NULL in record id=<id>           |
 
-  Scenario Outline: Error due to missing required table or partition column
-    Given the Databricks compute cluster is running and PySpark environment is available
-    And the Unity Catalog table "<table_name>" is "<table_state>"
-    And the column "state" is "<state_col_status>" in the table schema
-    When the PySpark script runs the backup operation
-    Then a "<backup_error>" error should be raised
+  Scenario: Parquet backup files are deleted after retention period
+    Given a backup parquet file was created on 2024-03-01 in "/Volumes/customer_360_raw_backup"
+    And today is 2024-06-01
+    When the retention policy job runs
+    Then the backup parquet file from 2024-03-01 is deleted from "/Volumes/customer_360_raw_backup"
 
-    Examples:
-      | table_name                                               | table_state     | state_col_status    | backup_error                                                         |
-      | purgo_databricks.purgo_playground.customer_360_raw       | missing         | present            | TABLE_NOT_FOUND: customer_360_raw table does not exist               |
-      | purgo_databricks.purgo_playground.customer_360_raw       | available       | missing            | PARTITION_COLUMN_MISSING: Required partition column 'state' missing  |
+  Scenario: Logging of all backup and vacuum operations
+    Given a backup or vacuum operation is triggered
+    When the operation completes (success or failure)
+    Then a record is inserted into purgo_playground.customer_360_raw_backup_log with
+      | timestamp          | status   | operation_type | record_count | error_message |
+      | <ISO8601 datetime> | <status> | <BACKUP|VACUUM>| <count>      | <error>       |
 
-  Scenario: Successful vacuum operation to clean records older than 30 days from source table
-    Given the Unity Catalog table "purgo_databricks.purgo_playground.customer_360_raw" contains records with "updated_at" timestamps ranging before and after "2024-05-31 12:00:00"
-    And the Databricks session is authorized for "VACUUM" and "DELETE" operations on the table
-    When the script executes a vacuum operation to retain only records where "updated_at" >= "2024-05-31 12:00:00"
-    Then only records with "updated_at" value on or after "2024-05-31 12:00:00" should remain in the Unity Catalog table
-    And all records with "updated_at" earlier than "2024-05-31 12:00:00" must be permanently removed from storage
+  Scenario: Backup and vacuum operations are scheduled and executed daily at 02:00 UTC
+    Given the current time is 02:00 UTC
+    When the scheduled job runs
+    Then the backup operation is performed
+    And the vacuum operation is performed immediately after backup
 
-  Scenario Outline: Vacuum operation error due to faulty datetime format in "updated_at"
-    Given the Unity Catalog table contains at least one record with "updated_at" = "<bad_datetime>"
-    When the script attempts to filter or vacuum based on "updated_at" for the last 30 days
-    Then the script should raise an error with the message "<vacuum_error>"
+  Scenario: Backup includes all columns from source table
+    Given the purgo_playground.customer_360_raw table has columns
+      | id | name | email | phone | company | job_title | address | city | state | country | industry | account_manager | creation_date | last_interaction_date | purchase_history | notes | zip |
+    When the backup operation is triggered
+    Then the parquet files in "/Volumes/customer_360_raw_backup" contain all columns as above
 
-    Examples:
-      | bad_datetime        | vacuum_error                                       |
-      | 2024/06/01T12:00Z   | INVALID_DATETIME_FORMAT: 'updated_at' is not yyyy-MM-dd HH:mm:ss |
-      | NULL                | NULL_DATETIME_ERROR: 'updated_at' field is null   |
+  Scenario: Parquet files are partitioned by state
+    Given the purgo_playground.customer_360_raw table contains records with state values "CA", "NY", "TX"
+    When the backup operation is triggered
+    Then the parquet files in "/Volumes/customer_360_raw_backup" are partitioned into directories
+      | /Volumes/customer_360_raw_backup/state=CA/ |
+      | /Volumes/customer_360_raw_backup/state=NY/ |
+      | /Volumes/customer_360_raw_backup/state=TX/ |
 
-  Scenario: Data consistency check post-backup
-    Given the backup Parquet files are present in "/Volumes/customer_360_raw_backup"
-    And partitioning by "state" is applied
-    When the Parquet files are read back into a DataFrame
-    Then the DataFrame row count must be equal to the row count of the Unity Catalog "customer_360_raw" table at the time of backup
-    And the column names and their data types must match the source schema exactly
-    And no data corruption or loss is allowed
+  Scenario: Parquet files are compressed using snappy
+    Given the backup operation is triggered
+    Then the resulting parquet files in "/Volumes/customer_360_raw_backup" use snappy compression
 
-  Scenario Outline: Backup script should handle missing or empty data gracefully
-    Given the Unity Catalog table contains "<row_count>" records
-    When the backup script is executed
-    Then the backup directory "<expected_output>"
+  Scenario: Only records from the last 30 days are retained after vacuum
+    Given today is 2024-06-30
+    And the purgo_playground.customer_360_raw table contains records with creation_date from 2024-05-01 to 2024-06-30
+    When the vacuum operation is triggered
+    Then only records with creation_date >= 2024-05-31 are retained
 
-    Examples:
-      | row_count | expected_output                                                 |
-      | 0         | remains empty, and logs "NO_DATA_TO_BACKUP"                    |
-      | null      | remains empty, and logs "TABLE_NOT_FOUND_OR_EMPTY"              |
+  Scenario: Error is logged if backup log table is unavailable
+    Given the purgo_playground.customer_360_raw_backup_log table is unavailable
+    When the backup or vacuum operation is triggered
+    Then the operation fails
+    And an error is raised: "Backup log table unavailable"
 
-  Scenario: Script logs operations and errors to /dbfs/logs/customer_360_raw_backup.log
-    Given the script is executed with logging enabled
-    When an operation is performed (backup, vacuum, error)
-    Then operation details, timestamps, and exceptions must be appended as a JSON object to "/dbfs/logs/customer_360_raw_backup.log"
-    And log entries must include fields: "event_time", "operation", "status", "details", "error_message" (if any)
+  Scenario: Backup and vacuum operations are atomic and do not leave partial state
+    Given the backup operation is in progress
+    And a failure occurs before completion
+    Then no partial parquet files are left in "/Volumes/customer_360_raw_backup"
+    And the backup log table purgo_playground.customer_360_raw_backup_log contains a record with status "FAILED"
 
-  Scenario: Parquet backup process must not allow uncompressed output
-    When the script is configured with compression codec "none"
-    Then the script must raise an error "COMPRESSION_REQUIRED: Output compression must be enabled"
+  Scenario: Backup and vacuum operations are idempotent
+    Given the backup and vacuum operations are triggered multiple times within the same day
+    When the operations run
+    Then only one backup and one vacuum are performed per day
+    And duplicate log entries are not created for the same operation and day
+
+  Scenario: Backup and vacuum operations are auditable
+    Given the backup and vacuum operations are performed
+    Then all operation details are available in purgo_playground.customer_360_raw_backup_log for audit purposes
+
+  Scenario: Backup operation is incremental if specified
+    Given the backup type is set to "incremental"
+    And only records with creation_date > last backup date exist
+    When the backup operation is triggered
+    Then only new or changed records are written to "/Volumes/customer_360_raw_backup"
+    And the backup log table purgo_playground.customer_360_raw_backup_log contains a record with the correct record_count
+
+  Scenario: Backup operation is full if specified
+    Given the backup type is set to "full"
+    When the backup operation is triggered
+    Then all records from purgo_playground.customer_360_raw are written to "/Volumes/customer_360_raw_backup"
+    And the backup log table purgo_playground.customer_360_raw_backup_log contains a record with the correct record_count
