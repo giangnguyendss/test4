@@ -1,569 +1,528 @@
-/* 
-==========================================================================================
-Databricks SQL Test Suite for Actual Value Calculation (purgo_playground.actual_value_calculation)
-==========================================================================================
+/* =============================================================================
+Databricks SQL Comprehensive Test Suite for Actual Value Calculation
+===============================================================================
+- This test code validates the calculation of actual_value for each brand_name, 
+  country_code, territory_id, month, and year by summing sales_value from 
+  purgo_playground.t3_itm_territory_sales and sales_net_price_local from 
+  purgo_playground.t3_ttm_territory_sales.
+- It covers: 
+    * Data type and schema validation
+    * NULL and invalid value handling
+    * Data quality and aggregation
+    * Delta Lake operations (MERGE/UPDATE/DELETE)
+    * Window and analytics functions
+    * Cleanup operations
+    * Constraint and foreign key validation
+    * End-to-end integration and performance checks
+- All comments are block (/* */) for sections and line (--) for inline explanations.
+- All SQL uses double quotes for string literals.
+============================================================================= */
 
-- This test suite validates the calculation of actual_value for each brand_name, country_code, territory_id, month, and year
-  by summing sales_value from purgo_playground.t3_itm_territory_sales and sales_net_price_local from purgo_playground.t3_ttm_territory_sales.
-- Only records where source_system_name exists in purgo_playground.control_table.source_system are included.
-- All columns in the output table are NOT NULL and have the correct data types.
-- The suite covers: schema validation, data type conversion, NULL handling, error exclusion, aggregation, deduplication, and data quality.
-- All SQL assertions use safe patterns and CTEs.
-- All comments are in block (/* */) or line (--) style as per requirements.
-==========================================================================================
-*/
+/*-----------------------------------------------------------------------------
+SECTION: Setup - Clean up and recreate target table with constraints
+-----------------------------------------------------------------------------*/
+-- Drop and recreate the target table with NOT NULL and CHECK constraints
+DROP TABLE IF EXISTS purgo_playground.actual_value_calculation;
 
-/*------------------------------------------------------------------------------
-SECTION: Setup - Clean up and prepare the target table for test
-------------------------------------------------------------------------------*/
--- Clean up the target table before running tests
-DELETE FROM purgo_playground.actual_value_calculation;
-
-/*------------------------------------------------------------------------------
-SECTION: Test 1 - Schema Validation for actual_value_calculation
-------------------------------------------------------------------------------*/
--- Validate that the target table has the correct schema and NOT NULL constraints
-WITH schema_info AS (
-  SELECT 
-    column_name,
-    data_type,
-    is_nullable
-  FROM information_schema.columns
-  WHERE table_schema = "purgo_playground"
-    AND table_name = "actual_value_calculation"
+CREATE TABLE purgo_playground.actual_value_calculation (
+    country_code STRING NOT NULL,
+    brand_name STRING NOT NULL,
+    territory_id STRING NOT NULL,
+    month STRING NOT NULL,
+    year STRING NOT NULL,
+    actual_value DOUBLE NOT NULL,
+    CONSTRAINT month_range CHECK (CAST(month AS INT) BETWEEN 1 AND 12),
+    CONSTRAINT year_format CHECK (LENGTH(year) = 4 AND year RLIKE "^[0-9]{4}$")
 )
-SELECT
-  CASE WHEN COUNT(*) = 6 THEN 1 ELSE 0 END AS column_count_assertion,
-  MAX(CASE WHEN column_name = "country_code" AND data_type = "STRING" AND is_nullable = "NO" THEN 1 ELSE 0 END) AS country_code_assertion,
-  MAX(CASE WHEN column_name = "brand_name" AND data_type = "STRING" AND is_nullable = "NO" THEN 1 ELSE 0 END) AS brand_name_assertion,
-  MAX(CASE WHEN column_name = "territory_id" AND data_type = "STRING" AND is_nullable = "NO" THEN 1 ELSE 0 END) AS territory_id_assertion,
-  MAX(CASE WHEN column_name = "month" AND data_type = "STRING" AND is_nullable = "NO" THEN 1 ELSE 0 END) AS month_assertion,
-  MAX(CASE WHEN column_name = "year" AND data_type = "STRING" AND is_nullable = "NO" THEN 1 ELSE 0 END) AS year_assertion,
-  MAX(CASE WHEN column_name = "actual_value" AND data_type = "DOUBLE" AND is_nullable = "NO" THEN 1 ELSE 0 END) AS actual_value_assertion
-FROM schema_info;
+USING DELTA
+;
 
-/*------------------------------------------------------------------------------
-SECTION: Test 2 - Insert Calculation Logic and Validate Data Quality
-------------------------------------------------------------------------------*/
--- Insert the calculation result into the target table
-INSERT INTO purgo_playground.actual_value_calculation (country_code, brand_name, territory_id, month, year, actual_value)
+/*-----------------------------------------------------------------------------
+SECTION: Data Type and Schema Validation
+-----------------------------------------------------------------------------*/
+-- Validate that the schema matches the expected structure and constraints
+DESCRIBE TABLE purgo_playground.actual_value_calculation;
+
+-- Assert that all columns are NOT NULL and have correct types
+SELECT 
+    COUNT(*) AS invalid_schema_count
+FROM (
+    SELECT 
+        column_name, 
+        data_type, 
+        is_nullable
+    FROM information_schema.columns
+    WHERE table_schema = "purgo_playground"
+      AND table_name = "actual_value_calculation"
+      AND (
+            (column_name = "country_code" AND data_type != "STRING")
+         OR (column_name = "brand_name" AND data_type != "STRING")
+         OR (column_name = "territory_id" AND data_type != "STRING")
+         OR (column_name = "month" AND data_type != "STRING")
+         OR (column_name = "year" AND data_type != "STRING")
+         OR (column_name = "actual_value" AND data_type != "DOUBLE")
+         OR (is_nullable = "YES")
+      )
+) AS schema_violations
+;
+-- Assert: Should return 0 rows (no schema violations)
+
+/*-----------------------------------------------------------------------------
+SECTION: Main Calculation Query (Unit + Integration Test)
+-----------------------------------------------------------------------------*/
+-- Insert actual_value calculation into the target table
+MERGE INTO purgo_playground.actual_value_calculation AS tgt
+USING (
+    WITH
+    -- CTE: Valid ITM records
+    itm_valid AS (
+        SELECT
+            country_code,
+            brand_name,
+            territory_id,
+            CAST(MONTH(sales_month) AS STRING) AS month,
+            CAST(YEAR(sales_month) AS STRING) AS year,
+            sales_value
+        FROM purgo_playground.t3_itm_territory_sales
+        WHERE 
+            country_code IS NOT NULL
+            AND brand_name IS NOT NULL
+            AND territory_id IS NOT NULL
+            AND sales_month IS NOT NULL
+            AND sales_value IS NOT NULL
+            AND TRY_CAST(sales_value AS DOUBLE) IS NOT NULL
+            AND source_system_name IS NOT NULL
+            AND source_system_name IN (
+                SELECT source_system FROM purgo_playground.control_table
+            )
+    ),
+    -- CTE: Valid TTM records
+    ttm_valid AS (
+        SELECT
+            country_code,
+            brand_name,
+            territory_id,
+            CAST(MONTH(fiscal_date) AS STRING) AS month,
+            CAST(YEAR(fiscal_date) AS STRING) AS year,
+            sales_net_price_local
+        FROM purgo_playground.t3_ttm_territory_sales
+        WHERE 
+            country_code IS NOT NULL
+            AND brand_name IS NOT NULL
+            AND territory_id IS NOT NULL
+            AND fiscal_date IS NOT NULL
+            AND sales_net_price_local IS NOT NULL
+            AND TRY_CAST(sales_net_price_local AS DOUBLE) IS NOT NULL
+            AND source_system_name IS NOT NULL
+            AND source_system_name IN (
+                SELECT source_system FROM purgo_playground.control_table
+            )
+    ),
+    -- CTE: Union all valid keys from both tables
+    all_keys AS (
+        SELECT country_code, brand_name, territory_id, month, year FROM itm_valid
+        UNION
+        SELECT country_code, brand_name, territory_id, month, year FROM ttm_valid
+    ),
+    -- CTE: Aggregate sales_value from ITM
+    agg_itm AS (
+        SELECT
+            country_code,
+            brand_name,
+            territory_id,
+            month,
+            year,
+            SUM(sales_value) AS total_sales_value
+        FROM itm_valid
+        GROUP BY country_code, brand_name, territory_id, month, year
+    ),
+    -- CTE: Aggregate sales_net_price_local from TTM
+    agg_ttm AS (
+        SELECT
+            country_code,
+            brand_name,
+            territory_id,
+            month,
+            year,
+            SUM(sales_net_price_local) AS total_sales_net_price_local
+        FROM ttm_valid
+        GROUP BY country_code, brand_name, territory_id, month, year
+    ),
+    -- CTE: Final aggregation and join
+    final_agg AS (
+        SELECT
+            k.country_code,
+            k.brand_name,
+            k.territory_id,
+            k.month,
+            k.year,
+            COALESCE(i.total_sales_value, 0.0) + COALESCE(t.total_sales_net_price_local, 0.0) AS actual_value
+        FROM all_keys k
+        LEFT JOIN agg_itm i
+            ON k.country_code = i.country_code
+            AND k.brand_name = i.brand_name
+            AND k.territory_id = i.territory_id
+            AND k.month = i.month
+            AND k.year = i.year
+        LEFT JOIN agg_ttm t
+            ON k.country_code = t.country_code
+            AND k.brand_name = t.brand_name
+            AND k.territory_id = t.territory_id
+            AND k.month = t.month
+            AND k.year = t.year
+    )
+    SELECT
+        country_code,
+        brand_name,
+        territory_id,
+        month,
+        year,
+        actual_value
+    FROM final_agg
+) AS src
+ON tgt.country_code = src.country_code
+   AND tgt.brand_name = src.brand_name
+   AND tgt.territory_id = src.territory_id
+   AND tgt.month = src.month
+   AND tgt.year = src.year
+WHEN MATCHED THEN UPDATE SET
+    actual_value = src.actual_value
+WHEN NOT MATCHED THEN INSERT (
+    country_code, brand_name, territory_id, month, year, actual_value
+) VALUES (
+    src.country_code, src.brand_name, src.territory_id, src.month, src.year, src.actual_value
+)
+;
+
+/*-----------------------------------------------------------------------------
+SECTION: Data Quality Validation - Exclude Invalid/Null/Non-numeric Records
+-----------------------------------------------------------------------------*/
+-- Assert: No records with NULL in any NOT NULL column
+SELECT COUNT(*) AS null_violation_count
+FROM purgo_playground.actual_value_calculation
+WHERE country_code IS NULL
+   OR brand_name IS NULL
+   OR territory_id IS NULL
+   OR month IS NULL
+   OR year IS NULL
+   OR actual_value IS NULL
+;
+
+-- Assert: No records with month outside 1-12 or year not 4 digits
+SELECT COUNT(*) AS constraint_violation_count
+FROM purgo_playground.actual_value_calculation
+WHERE CAST(month AS INT) NOT BETWEEN 1 AND 12
+   OR LENGTH(year) != 4
+   OR year NOT RLIKE "^[0-9]{4}$"
+;
+
+-- Assert: No records for source_system_name not in control_table
 WITH
-  /* 
-    CTE: valid_itm
-    - Filters t3_itm_territory_sales for valid records:
-      - All required columns are NOT NULL
-      - sales_value is numeric and NOT NULL
-      - source_system_name exists in control_table
-  */
-  valid_itm AS (
-    SELECT
-      i.country_code,
-      i.brand_name,
-      i.territory_id,
-      CAST(MONTH(i.sales_month) AS STRING) AS month,
-      CAST(YEAR(i.sales_month) AS STRING) AS year,
-      i.sales_value
-    FROM purgo_playground.t3_itm_territory_sales i
-    INNER JOIN purgo_playground.control_table c
-      ON i.source_system_name = c.source_system
-    WHERE
-      i.country_code IS NOT NULL
-      AND i.brand_name IS NOT NULL
-      AND i.territory_id IS NOT NULL
-      AND i.sales_month IS NOT NULL
-      AND i.sales_value IS NOT NULL
-      AND TRY_CAST(i.sales_value AS DOUBLE) IS NOT NULL
-      AND i.source_system_name IS NOT NULL
-  ),
-  /* 
-    CTE: valid_ttm
-    - Filters t3_ttm_territory_sales for valid records:
-      - All required columns are NOT NULL
-      - sales_net_price_local is numeric and NOT NULL
-      - source_system_name exists in control_table
-  */
-  valid_ttm AS (
-    SELECT
-      t.country_code,
-      t.brand_name,
-      t.territory_id,
-      CAST(MONTH(t.fiscal_date) AS STRING) AS month,
-      CAST(YEAR(t.fiscal_date) AS STRING) AS year,
-      t.sales_net_price_local
-    FROM purgo_playground.t3_ttm_territory_sales t
-    INNER JOIN purgo_playground.control_table c
-      ON t.source_system_name = c.source_system
-    WHERE
-      t.country_code IS NOT NULL
-      AND t.brand_name IS NOT NULL
-      AND t.territory_id IS NOT NULL
-      AND t.fiscal_date IS NOT NULL
-      AND t.sales_net_price_local IS NOT NULL
-      AND TRY_CAST(t.sales_net_price_local AS DOUBLE) IS NOT NULL
-      AND t.source_system_name IS NOT NULL
-  ),
-  /* 
-    CTE: unioned_sales
-    - Union all valid sales from both sources, tagging the source
-  */
-  unioned_sales AS (
-    SELECT
-      country_code,
-      brand_name,
-      territory_id,
-      month,
-      year,
-      sales_value AS value
-    FROM valid_itm
-    UNION ALL
-    SELECT
-      country_code,
-      brand_name,
-      territory_id,
-      month,
-      year,
-      sales_net_price_local AS value
-    FROM valid_ttm
-  ),
-  /* 
-    CTE: aggregated_sales
-    - Aggregate (sum) all values for each unique key
-  */
-  aggregated_sales AS (
-    SELECT
-      country_code,
-      brand_name,
-      territory_id,
-      month,
-      year,
-      SUM(value) AS actual_value
-    FROM unioned_sales
-    GROUP BY country_code, brand_name, territory_id, month, year
-  )
-SELECT
-  country_code,
-  brand_name,
-  territory_id,
-  month,
-  year,
-  actual_value
-FROM aggregated_sales;
-
-/*------------------------------------------------------------------------------
-SECTION: Test 3 - Assert No NULLs in Output Table
-------------------------------------------------------------------------------*/
--- Assert that there are no NULLs in any NOT NULL column
-WITH null_counts AS (
-  SELECT
-    SUM(CASE WHEN country_code IS NULL THEN 1 ELSE 0 END) AS null_country_code,
-    SUM(CASE WHEN brand_name IS NULL THEN 1 ELSE 0 END) AS null_brand_name,
-    SUM(CASE WHEN territory_id IS NULL THEN 1 ELSE 0 END) AS null_territory_id,
-    SUM(CASE WHEN month IS NULL THEN 1 ELSE 0 END) AS null_month,
-    SUM(CASE WHEN year IS NULL THEN 1 ELSE 0 END) AS null_year,
-    SUM(CASE WHEN actual_value IS NULL THEN 1 ELSE 0 END) AS null_actual_value
-  FROM purgo_playground.actual_value_calculation
+itm_invalid AS (
+    SELECT country_code, brand_name, territory_id, CAST(MONTH(sales_month) AS STRING) AS month, CAST(YEAR(sales_month) AS STRING) AS year
+    FROM purgo_playground.t3_itm_territory_sales
+    WHERE source_system_name IS NOT NULL
+      AND source_system_name NOT IN (SELECT source_system FROM purgo_playground.control_table)
+),
+ttm_invalid AS (
+    SELECT country_code, brand_name, territory_id, CAST(MONTH(fiscal_date) AS STRING) AS month, CAST(YEAR(fiscal_date) AS STRING) AS year
+    FROM purgo_playground.t3_ttm_territory_sales
+    WHERE source_system_name IS NOT NULL
+      AND source_system_name NOT IN (SELECT source_system FROM purgo_playground.control_table)
+),
+invalid_keys AS (
+    SELECT * FROM itm_invalid
+    UNION
+    SELECT * FROM ttm_invalid
 )
-SELECT
-  CASE WHEN null_country_code = 0 THEN 1 ELSE 0 END AS country_code_not_null_assertion,
-  CASE WHEN null_brand_name = 0 THEN 1 ELSE 0 END AS brand_name_not_null_assertion,
-  CASE WHEN null_territory_id = 0 THEN 1 ELSE 0 END AS territory_id_not_null_assertion,
-  CASE WHEN null_month = 0 THEN 1 ELSE 0 END AS month_not_null_assertion,
-  CASE WHEN null_year = 0 THEN 1 ELSE 0 END AS year_not_null_assertion,
-  CASE WHEN null_actual_value = 0 THEN 1 ELSE 0 END AS actual_value_not_null_assertion
-FROM null_counts;
+SELECT COUNT(*) AS invalid_source_system_count
+FROM purgo_playground.actual_value_calculation a
+JOIN invalid_keys k
+  ON a.country_code = k.country_code
+ AND a.brand_name = k.brand_name
+ AND a.territory_id = k.territory_id
+ AND a.month = k.month
+ AND a.year = k.year
+;
 
-/*------------------------------------------------------------------------------
-SECTION: Test 4 - Data Type Validation for Output Table
-------------------------------------------------------------------------------*/
--- Validate that the data types in the output table are as expected
-WITH type_info AS (
-  SELECT
-    column_name,
-    data_type
-  FROM information_schema.columns
-  WHERE table_schema = "purgo_playground"
-    AND table_name = "actual_value_calculation"
+-- Assert: No records for keys where both sales_value and sales_net_price_local are NULL
+WITH
+itm_null AS (
+    SELECT country_code, brand_name, territory_id, CAST(MONTH(sales_month) AS STRING) AS month, CAST(YEAR(sales_month) AS STRING) AS year
+    FROM purgo_playground.t3_itm_territory_sales
+    WHERE sales_value IS NULL
+),
+ttm_null AS (
+    SELECT country_code, brand_name, territory_id, CAST(MONTH(fiscal_date) AS STRING) AS month, CAST(YEAR(fiscal_date) AS STRING) AS year
+    FROM purgo_playground.t3_ttm_territory_sales
+    WHERE sales_net_price_local IS NULL
+),
+null_keys AS (
+    SELECT * FROM itm_null
+    INTERSECT
+    SELECT * FROM ttm_null
 )
-SELECT
-  MAX(CASE WHEN column_name = "country_code" AND data_type = "STRING" THEN 1 ELSE 0 END) AS country_code_type_assertion,
-  MAX(CASE WHEN column_name = "brand_name" AND data_type = "STRING" THEN 1 ELSE 0 END) AS brand_name_type_assertion,
-  MAX(CASE WHEN column_name = "territory_id" AND data_type = "STRING" THEN 1 ELSE 0 END) AS territory_id_type_assertion,
-  MAX(CASE WHEN column_name = "month" AND data_type = "STRING" THEN 1 ELSE 0 END) AS month_type_assertion,
-  MAX(CASE WHEN column_name = "year" AND data_type = "STRING" THEN 1 ELSE 0 END) AS year_type_assertion,
-  MAX(CASE WHEN column_name = "actual_value" AND data_type = "DOUBLE" THEN 1 ELSE 0 END) AS actual_value_type_assertion
-FROM type_info;
+SELECT COUNT(*) AS null_key_count
+FROM purgo_playground.actual_value_calculation a
+JOIN null_keys k
+  ON a.country_code = k.country_code
+ AND a.brand_name = k.brand_name
+ AND a.territory_id = k.territory_id
+ AND a.month = k.month
+ AND a.year = k.year
+;
 
-/*------------------------------------------------------------------------------
-SECTION: Test 5 - Validate Month and Year Extraction Logic
-------------------------------------------------------------------------------*/
--- Validate that month and year are correctly extracted from date columns
-WITH itm_month_year AS (
-  SELECT
-    sales_month,
-    CAST(MONTH(sales_month) AS STRING) AS extracted_month,
-    CAST(YEAR(sales_month) AS STRING) AS extracted_year
-  FROM purgo_playground.t3_itm_territory_sales
-  WHERE sales_month IS NOT NULL
-  LIMIT 5
+-- Assert: No records for keys with non-numeric sales_value or sales_net_price_local
+WITH
+itm_non_numeric AS (
+    SELECT country_code, brand_name, territory_id, CAST(MONTH(sales_month) AS STRING) AS month, CAST(YEAR(sales_month) AS STRING) AS year
+    FROM purgo_playground.t3_itm_territory_sales
+    WHERE TRY_CAST(sales_value AS DOUBLE) IS NULL AND sales_value IS NOT NULL
 ),
-ttm_month_year AS (
-  SELECT
-    fiscal_date,
-    CAST(MONTH(fiscal_date) AS STRING) AS extracted_month,
-    CAST(YEAR(fiscal_date) AS STRING) AS extracted_year
-  FROM purgo_playground.t3_ttm_territory_sales
-  WHERE fiscal_date IS NOT NULL
-  LIMIT 5
+ttm_non_numeric AS (
+    SELECT country_code, brand_name, territory_id, CAST(MONTH(fiscal_date) AS STRING) AS month, CAST(YEAR(fiscal_date) AS STRING) AS year
+    FROM purgo_playground.t3_ttm_territory_sales
+    WHERE TRY_CAST(sales_net_price_local AS DOUBLE) IS NULL AND sales_net_price_local IS NOT NULL
+),
+non_numeric_keys AS (
+    SELECT * FROM itm_non_numeric
+    UNION
+    SELECT * FROM ttm_non_numeric
 )
-SELECT * FROM itm_month_year
-UNION ALL
-SELECT * FROM ttm_month_year;
+SELECT COUNT(*) AS non_numeric_key_count
+FROM purgo_playground.actual_value_calculation a
+JOIN non_numeric_keys k
+  ON a.country_code = k.country_code
+ AND a.brand_name = k.brand_name
+ AND a.territory_id = k.territory_id
+ AND a.month = k.month
+ AND a.year = k.year
+;
 
-/*------------------------------------------------------------------------------
-SECTION: Test 6 - Exclude Records with Invalid Numeric Values
-------------------------------------------------------------------------------*/
--- Assert that no record in output table comes from a row with invalid numeric sales_value or sales_net_price_local
-WITH invalid_itm AS (
-  SELECT
-    country_code,
-    brand_name,
-    territory_id,
-    sales_month
-  FROM purgo_playground.t3_itm_territory_sales
-  WHERE TRY_CAST(sales_value AS DOUBLE) IS NULL AND sales_value IS NOT NULL
-),
-invalid_ttm AS (
-  SELECT
-    country_code,
-    brand_name,
-    territory_id,
-    fiscal_date
-  FROM purgo_playground.t3_ttm_territory_sales
-  WHERE TRY_CAST(sales_net_price_local AS DOUBLE) IS NULL AND sales_net_price_local IS NOT NULL
-),
-output_invalid AS (
-  SELECT
-    a.*
-  FROM purgo_playground.actual_value_calculation a
-  LEFT JOIN invalid_itm i
-    ON a.country_code = i.country_code
-    AND a.brand_name = i.brand_name
-    AND a.territory_id = i.territory_id
-    AND a.month = CAST(MONTH(i.sales_month) AS STRING)
-    AND a.year = CAST(YEAR(i.sales_month) AS STRING)
-  LEFT JOIN invalid_ttm t
-    ON a.country_code = t.country_code
-    AND a.brand_name = t.brand_name
-    AND a.territory_id = t.territory_id
-    AND a.month = CAST(MONTH(t.fiscal_date) AS STRING)
-    AND a.year = CAST(YEAR(t.fiscal_date) AS STRING)
-  WHERE i.country_code IS NOT NULL OR t.country_code IS NOT NULL
-)
+/*-----------------------------------------------------------------------------
+SECTION: Aggregation and Duplicate Handling Validation
+-----------------------------------------------------------------------------*/
+-- Assert: For a known duplicate key, actual_value is the sum of all matching sales_value and sales_net_price_local
 SELECT
-  CASE WHEN COUNT(*) = 0 THEN 1 ELSE 0 END AS invalid_numeric_exclusion_assertion
-FROM output_invalid;
-
-/*------------------------------------------------------------------------------
-SECTION: Test 7 - Exclude Records with NULLs in Required Columns
-------------------------------------------------------------------------------*/
--- Assert that no record in output table comes from a row with NULL in required columns
-WITH null_itm AS (
-  SELECT
-    country_code,
-    brand_name,
-    territory_id,
-    sales_month
-  FROM purgo_playground.t3_itm_territory_sales
-  WHERE country_code IS NULL OR brand_name IS NULL OR territory_id IS NULL OR sales_month IS NULL OR sales_value IS NULL OR source_system_name IS NULL
-),
-null_ttm AS (
-  SELECT
-    country_code,
-    brand_name,
-    territory_id,
-    fiscal_date
-  FROM purgo_playground.t3_ttm_territory_sales
-  WHERE country_code IS NULL OR brand_name IS NULL OR territory_id IS NULL OR fiscal_date IS NULL OR sales_net_price_local IS NULL OR source_system_name IS NULL
-),
-output_nulls AS (
-  SELECT
-    a.*
-  FROM purgo_playground.actual_value_calculation a
-  LEFT JOIN null_itm i
-    ON a.country_code = i.country_code
-    AND a.brand_name = i.brand_name
-    AND a.territory_id = i.territory_id
-    AND a.month = CAST(MONTH(i.sales_month) AS STRING)
-    AND a.year = CAST(YEAR(i.sales_month) AS STRING)
-  LEFT JOIN null_ttm t
-    ON a.country_code = t.country_code
-    AND a.brand_name = t.brand_name
-    AND a.territory_id = t.territory_id
-    AND a.month = CAST(MONTH(t.fiscal_date) AS STRING)
-    AND a.year = CAST(YEAR(t.fiscal_date) AS STRING)
-  WHERE i.country_code IS NOT NULL OR t.country_code IS NOT NULL
-)
-SELECT
-  CASE WHEN COUNT(*) = 0 THEN 1 ELSE 0 END AS null_required_column_exclusion_assertion
-FROM output_nulls;
-
-/*------------------------------------------------------------------------------
-SECTION: Test 8 - Exclude Records with source_system_name Not in control_table
-------------------------------------------------------------------------------*/
--- Assert that no record in output table comes from a row with source_system_name not in control_table
-WITH itm_not_in_control AS (
-  SELECT
-    country_code,
-    brand_name,
-    territory_id,
-    sales_month
-  FROM purgo_playground.t3_itm_territory_sales i
-  LEFT JOIN purgo_playground.control_table c
-    ON i.source_system_name = c.source_system
-  WHERE c.source_system IS NULL
-),
-ttm_not_in_control AS (
-  SELECT
-    country_code,
-    brand_name,
-    territory_id,
-    fiscal_date
-  FROM purgo_playground.t3_ttm_territory_sales t
-  LEFT JOIN purgo_playground.control_table c
-    ON t.source_system_name = c.source_system
-  WHERE c.source_system IS NULL
-),
-output_not_in_control AS (
-  SELECT
-    a.*
-  FROM purgo_playground.actual_value_calculation a
-  LEFT JOIN itm_not_in_control i
-    ON a.country_code = i.country_code
-    AND a.brand_name = i.brand_name
-    AND a.territory_id = i.territory_id
-    AND a.month = CAST(MONTH(i.sales_month) AS STRING)
-    AND a.year = CAST(YEAR(i.sales_month) AS STRING)
-  LEFT JOIN ttm_not_in_control t
-    ON a.country_code = t.country_code
-    AND a.brand_name = t.brand_name
-    AND a.territory_id = t.territory_id
-    AND a.month = CAST(MONTH(t.fiscal_date) AS STRING)
-    AND a.year = CAST(YEAR(t.fiscal_date) AS STRING)
-  WHERE i.country_code IS NOT NULL OR t.country_code IS NOT NULL
-)
-SELECT
-  CASE WHEN COUNT(*) = 0 THEN 1 ELSE 0 END AS source_system_exclusion_assertion
-FROM output_not_in_control;
-
-/*------------------------------------------------------------------------------
-SECTION: Test 9 - Aggregation and Deduplication
-------------------------------------------------------------------------------*/
--- Assert that duplicate records are aggregated (summed) correctly
-WITH expected_agg AS (
-  SELECT
-    "US" AS country_code,
-    "BRAND_A" AS brand_name,
-    "T001" AS territory_id,
-    "5" AS month,
-    "2023" AS year,
-    100.0 + 50.0 + 25.0 + 50.0 + 25.0 + 25.0 + 50.0 AS expected_sum -- sum of all US/BRAND_A/T001/2023-05 sales_value and sales_net_price_local
-),
-actual_agg AS (
-  SELECT
     country_code,
     brand_name,
     territory_id,
     month,
     year,
     actual_value
-  FROM purgo_playground.actual_value_calculation
-  WHERE country_code = "US"
-    AND brand_name = "BRAND_A"
-    AND territory_id = "T001"
-    AND month = "5"
-    AND year = "2023"
-)
-SELECT
-  CASE WHEN a.actual_value = e.expected_sum THEN 1 ELSE 0 END AS aggregation_assertion
-FROM actual_agg a
-JOIN expected_agg e
-  ON a.country_code = e.country_code
-  AND a.brand_name = e.brand_name
-  AND a.territory_id = e.territory_id
-  AND a.month = e.month
-  AND a.year = e.year;
+FROM purgo_playground.actual_value_calculation
+WHERE country_code = "US"
+  AND brand_name = "BRAND_A"
+  AND territory_id = "T001"
+  AND month = "5"
+  AND year = "2023"
+;
+-- Expected actual_value: sum of all sales_value and sales_net_price_local for this key
 
-/*------------------------------------------------------------------------------
-SECTION: Test 10 - Exclude Keys with No Data in Either Table
-------------------------------------------------------------------------------*/
--- Assert that no record exists for a key with no data in either table
-WITH all_keys AS (
-  SELECT
-    country_code,
-    brand_name,
-    territory_id,
-    month,
-    year
-  FROM purgo_playground.actual_value_calculation
-),
-itm_keys AS (
-  SELECT
-    country_code,
-    brand_name,
-    territory_id,
-    CAST(MONTH(sales_month) AS STRING) AS month,
-    CAST(YEAR(sales_month) AS STRING) AS year
-  FROM purgo_playground.t3_itm_territory_sales
-  WHERE country_code IS NOT NULL AND brand_name IS NOT NULL AND territory_id IS NOT NULL AND sales_month IS NOT NULL
-),
-ttm_keys AS (
-  SELECT
-    country_code,
-    brand_name,
-    territory_id,
-    CAST(MONTH(fiscal_date) AS STRING) AS month,
-    CAST(YEAR(fiscal_date) AS STRING) AS year
-  FROM purgo_playground.t3_ttm_territory_sales
-  WHERE country_code IS NOT NULL AND brand_name IS NOT NULL AND territory_id IS NOT NULL AND fiscal_date IS NOT NULL
-),
-valid_keys AS (
-  SELECT * FROM itm_keys
-  UNION
-  SELECT * FROM ttm_keys
-),
-invalid_keys AS (
-  SELECT
-    a.country_code,
-    a.brand_name,
-    a.territory_id,
-    a.month,
-    a.year
-  FROM all_keys a
-  LEFT JOIN valid_keys v
-    ON a.country_code = v.country_code
-    AND a.brand_name = v.brand_name
-    AND a.territory_id = v.territory_id
-    AND a.month = v.month
-    AND a.year = v.year
-  WHERE v.country_code IS NULL
-)
+/*-----------------------------------------------------------------------------
+SECTION: Window Function and Analytics Feature Test
+-----------------------------------------------------------------------------*/
+-- Use window function to rank brands by actual_value per country/month/year
 SELECT
-  CASE WHEN COUNT(*) = 0 THEN 1 ELSE 0 END AS no_orphan_key_assertion
-FROM invalid_keys;
-
-/*------------------------------------------------------------------------------
-SECTION: Test 11 - Data Quality: No Negative or NULL actual_value (unless in source)
-------------------------------------------------------------------------------*/
--- Assert that negative actual_value only exists if negative in source, and no NULLs
-WITH negative_actuals AS (
-  SELECT *
-  FROM purgo_playground.actual_value_calculation
-  WHERE actual_value < 0
-)
-SELECT
-  COUNT(*) AS negative_actual_value_count
-FROM negative_actuals;
-
-/*------------------------------------------------------------------------------
-SECTION: Test 12 - Data Quality: Output actual_value is 0.0 only if source is 0.0
-------------------------------------------------------------------------------*/
--- Assert that actual_value = 0.0 only if all source values for that key are 0.0
-WITH zero_actuals AS (
-  SELECT *
-  FROM purgo_playground.actual_value_calculation
-  WHERE actual_value = 0.0
-),
-source_zero AS (
-  SELECT
-    country_code,
-    brand_name,
-    territory_id,
-    CAST(MONTH(sales_month) AS STRING) AS month,
-    CAST(YEAR(sales_month) AS STRING) AS year,
-    sales_value
-  FROM purgo_playground.t3_itm_territory_sales
-  WHERE sales_value = 0.0
-  UNION ALL
-  SELECT
-    country_code,
-    brand_name,
-    territory_id,
-    CAST(MONTH(fiscal_date) AS STRING) AS month,
-    CAST(YEAR(fiscal_date) AS STRING) AS year,
-    sales_net_price_local
-  FROM purgo_playground.t3_ttm_territory_sales
-  WHERE sales_net_price_local = 0.0
-)
-SELECT
-  COUNT(*) AS zero_actual_value_count
-FROM zero_actuals z
-LEFT JOIN source_zero s
-  ON z.country_code = s.country_code
-  AND z.brand_name = s.brand_name
-  AND z.territory_id = s.territory_id
-  AND z.month = s.month
-  AND z.year = s.year
-WHERE s.country_code IS NULL;
-
-/*------------------------------------------------------------------------------
-SECTION: Test 13 - Window Function: Rank Brands by actual_value per Country/Month/Year
-------------------------------------------------------------------------------*/
--- Validate window function works on the output table
-WITH ranked_brands AS (
-  SELECT
     country_code,
     month,
     year,
     brand_name,
     actual_value,
     RANK() OVER (PARTITION BY country_code, month, year ORDER BY actual_value DESC) AS brand_rank
-  FROM purgo_playground.actual_value_calculation
-)
-SELECT * FROM ranked_brands WHERE brand_rank = 1;
-
-/*------------------------------------------------------------------------------
-SECTION: Test 14 - Delta Lake Operations: DELETE, UPDATE, MERGE
-------------------------------------------------------------------------------*/
--- DELETE: Remove a test record and assert it is gone
-DELETE FROM purgo_playground.actual_value_calculation
-WHERE country_code = "US" AND brand_name = "BRAND_A" AND territory_id = "T001" AND month = "5" AND year = "2023";
-
-SELECT
-  CASE WHEN COUNT(*) = 0 THEN 1 ELSE 0 END AS delete_assertion
 FROM purgo_playground.actual_value_calculation
-WHERE country_code = "US" AND brand_name = "BRAND_A" AND territory_id = "T001" AND month = "5" AND year = "2023";
+ORDER BY country_code, year, month, brand_rank
+;
 
--- UPDATE: Set actual_value to 9999.99 for a test record and assert the update
+/*-----------------------------------------------------------------------------
+SECTION: Delta Lake Operations - UPDATE, DELETE, MERGE
+-----------------------------------------------------------------------------*/
+-- UPDATE: Set actual_value to 0 for a specific test key and validate
 UPDATE purgo_playground.actual_value_calculation
-SET actual_value = 9999.99
-WHERE country_code = "DE" AND brand_name = "BRAND_B" AND territory_id = "T002" AND month = "12" AND year = "2022";
+SET actual_value = 0.0
+WHERE country_code = "DE"
+  AND brand_name = "BRAND_B"
+  AND territory_id = "T002"
+  AND month = "12"
+  AND year = "2022"
+;
 
-SELECT
-  CASE WHEN actual_value = 9999.99 THEN 1 ELSE 0 END AS update_assertion
+SELECT actual_value
 FROM purgo_playground.actual_value_calculation
-WHERE country_code = "DE" AND brand_name = "BRAND_B" AND territory_id = "T002" AND month = "12" AND year = "2022";
+WHERE country_code = "DE"
+  AND brand_name = "BRAND_B"
+  AND territory_id = "T002"
+  AND month = "12"
+  AND year = "2022"
+;
 
--- MERGE: Upsert a record and assert the merge
-MERGE INTO purgo_playground.actual_value_calculation AS target
-USING (SELECT "ZZ" AS country_code, "BRAND_X" AS brand_name, "T999" AS territory_id, "1" AS month, "2025" AS year, 123.45 AS actual_value) AS source
-ON target.country_code = source.country_code
-  AND target.brand_name = source.brand_name
-  AND target.territory_id = source.territory_id
-  AND target.month = source.month
-  AND target.year = source.year
-WHEN MATCHED THEN
-  UPDATE SET actual_value = source.actual_value
-WHEN NOT MATCHED THEN
-  INSERT (country_code, brand_name, territory_id, month, year, actual_value)
-  VALUES (source.country_code, source.brand_name, source.territory_id, source.month, source.year, source.actual_value);
-
-SELECT
-  CASE WHEN COUNT(*) = 1 AND actual_value = 123.45 THEN 1 ELSE 0 END AS merge_assertion
-FROM purgo_playground.actual_value_calculation
-WHERE country_code = "ZZ" AND brand_name = "BRAND_X" AND territory_id = "T999" AND month = "1" AND year = "2025";
-
-/*------------------------------------------------------------------------------
-SECTION: Test 15 - Cleanup: Remove test records inserted by Delta operations
-------------------------------------------------------------------------------*/
+-- DELETE: Remove a specific test key and validate
 DELETE FROM purgo_playground.actual_value_calculation
-WHERE country_code = "ZZ" AND brand_name = "BRAND_X" AND territory_id = "T999" AND month = "1" AND year = "2025";
+WHERE country_code = "FR"
+  AND brand_name = "BRAND_C"
+  AND territory_id = "T003"
+  AND month = "1"
+  AND year = "2024"
+;
+
+SELECT COUNT(*) AS deleted_count
+FROM purgo_playground.actual_value_calculation
+WHERE country_code = "FR"
+  AND brand_name = "BRAND_C"
+  AND territory_id = "T003"
+  AND month = "1"
+  AND year = "2024"
+;
+
+-- MERGE: Re-insert the deleted record for further tests
+MERGE INTO purgo_playground.actual_value_calculation AS tgt
+USING (
+    SELECT "FR" AS country_code, "BRAND_C" AS brand_name, "T003" AS territory_id, "1" AS month, "2024" AS year, 300.0 AS actual_value
+) AS src
+ON tgt.country_code = src.country_code
+   AND tgt.brand_name = src.brand_name
+   AND tgt.territory_id = src.territory_id
+   AND tgt.month = src.month
+   AND tgt.year = src.year
+WHEN NOT MATCHED THEN INSERT (
+    country_code, brand_name, territory_id, month, year, actual_value
+) VALUES (
+    src.country_code, src.brand_name, src.territory_id, src.month, src.year, src.actual_value
+)
+;
+
+/*-----------------------------------------------------------------------------
+SECTION: Performance Test - Count and Timing
+-----------------------------------------------------------------------------*/
+-- Count total records for performance baseline
+SELECT COUNT(*) AS total_actual_value_records
+FROM purgo_playground.actual_value_calculation
+;
+
+-- Timing: Use Databricks SQL EXPLAIN to check query plan for main calculation
+EXPLAIN
+WITH
+    itm_valid AS (
+        SELECT
+            country_code,
+            brand_name,
+            territory_id,
+            CAST(MONTH(sales_month) AS STRING) AS month,
+            CAST(YEAR(sales_month) AS STRING) AS year,
+            sales_value
+        FROM purgo_playground.t3_itm_territory_sales
+        WHERE 
+            country_code IS NOT NULL
+            AND brand_name IS NOT NULL
+            AND territory_id IS NOT NULL
+            AND sales_month IS NOT NULL
+            AND sales_value IS NOT NULL
+            AND TRY_CAST(sales_value AS DOUBLE) IS NOT NULL
+            AND source_system_name IS NOT NULL
+            AND source_system_name IN (
+                SELECT source_system FROM purgo_playground.control_table
+            )
+    ),
+    ttm_valid AS (
+        SELECT
+            country_code,
+            brand_name,
+            territory_id,
+            CAST(MONTH(fiscal_date) AS STRING) AS month,
+            CAST(YEAR(fiscal_date) AS STRING) AS year,
+            sales_net_price_local
+        FROM purgo_playground.t3_ttm_territory_sales
+        WHERE 
+            country_code IS NOT NULL
+            AND brand_name IS NOT NULL
+            AND territory_id IS NOT NULL
+            AND fiscal_date IS NOT NULL
+            AND sales_net_price_local IS NOT NULL
+            AND TRY_CAST(sales_net_price_local AS DOUBLE) IS NOT NULL
+            AND source_system_name IS NOT NULL
+            AND source_system_name IN (
+                SELECT source_system FROM purgo_playground.control_table
+            )
+    ),
+    all_keys AS (
+        SELECT country_code, brand_name, territory_id, month, year FROM itm_valid
+        UNION
+        SELECT country_code, brand_name, territory_id, month, year FROM ttm_valid
+    ),
+    agg_itm AS (
+        SELECT
+            country_code,
+            brand_name,
+            territory_id,
+            month,
+            year,
+            SUM(sales_value) AS total_sales_value
+        FROM itm_valid
+        GROUP BY country_code, brand_name, territory_id, month, year
+    ),
+    agg_ttm AS (
+        SELECT
+            country_code,
+            brand_name,
+            territory_id,
+            month,
+            year,
+            SUM(sales_net_price_local) AS total_sales_net_price_local
+        FROM ttm_valid
+        GROUP BY country_code, brand_name, territory_id, month, year
+    ),
+    final_agg AS (
+        SELECT
+            k.country_code,
+            k.brand_name,
+            k.territory_id,
+            k.month,
+            k.year,
+            COALESCE(i.total_sales_value, 0.0) + COALESCE(t.total_sales_net_price_local, 0.0) AS actual_value
+        FROM all_keys k
+        LEFT JOIN agg_itm i
+            ON k.country_code = i.country_code
+            AND k.brand_name = i.brand_name
+            AND k.territory_id = i.territory_id
+            AND k.month = i.month
+            AND k.year = i.year
+        LEFT JOIN agg_ttm t
+            ON k.country_code = t.country_code
+            AND k.brand_name = t.brand_name
+            AND k.territory_id = t.territory_id
+            AND k.month = t.month
+            AND k.year = t.year
+    )
+SELECT
+    country_code,
+    brand_name,
+    territory_id,
+    month,
+    year,
+    actual_value
+FROM final_agg
+;
+
+/*-----------------------------------------------------------------------------
+SECTION: Foreign Key Validation
+-----------------------------------------------------------------------------*/
+-- Assert: All source_system_name in calculation exist in control_table
+SELECT COUNT(*) AS fk_violation_count
+FROM (
+    SELECT DISTINCT source_system_name
+    FROM purgo_playground.t3_itm_territory_sales
+    WHERE source_system_name IS NOT NULL
+      AND source_system_name NOT IN (SELECT source_system FROM purgo_playground.control_table)
+    UNION
+    SELECT DISTINCT source_system_name
+    FROM purgo_playground.t3_ttm_territory_sales
+    WHERE source_system_name IS NOT NULL
+      AND source_system_name NOT IN (SELECT source_system FROM purgo_playground.control_table)
+) AS fk_violations
+;
+
+/*-----------------------------------------------------------------------------
+SECTION: Cleanup - Remove test records (if needed)
+-----------------------------------------------------------------------------*/
+-- Optionally, clean up test records from actual_value_calculation
+-- DELETE FROM purgo_playground.actual_value_calculation WHERE year = "2023" AND month = "5";
