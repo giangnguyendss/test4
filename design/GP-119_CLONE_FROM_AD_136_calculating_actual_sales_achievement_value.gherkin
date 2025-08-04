@@ -1,0 +1,178 @@
+Feature: Calculate actual sales value per brand, country, territory, month, and year
+
+  This feature calculates the actual_value for each combination of brand_name, country_code, territory_id, month, and year by summing sales_value from purgo_playground.t3_itm_territory_sales and sales_net_price_local from purgo_playground.t3_ttm_territory_sales. Only records where source_system_name exists in purgo_playground.control_table.source_system are included.
+
+  Background:
+    Given the following tables exist in the purgo_playground schema:
+      | Table Name                        |
+      | t3_itm_territory_sales            |
+      | t3_ttm_territory_sales            |
+      | control_table                     |
+      | actual_value_calculation          |
+    And the t3_itm_territory_sales table has columns:
+      | country_code | brand_name | source_system_name | territory_id | sales_value | sales_month |
+    And the t3_ttm_territory_sales table has columns:
+      | country_code | brand_name | source_system_name | territory_id | sales_net_price_local | fiscal_date |
+    And the control_table has columns:
+      | country_code | source_system | brand_name |
+    And the actual_value_calculation table has columns:
+      | country_code | brand_name | territory_id | month | year | actual_value |
+    And the month and year are extracted as:
+      | Table                    | Date Column   | Extraction Logic                |
+      | t3_itm_territory_sales   | sales_month   | month: MONTH(sales_month), year: YEAR(sales_month) |
+      | t3_ttm_territory_sales   | fiscal_date   | month: MONTH(fiscal_date), year: YEAR(fiscal_date) |
+    And only records where source_system_name from both sales tables exist in control_table.source_system are included in the calculation
+
+  Scenario Outline: Calculate actual_value for valid records from both tables
+    Given t3_itm_territory_sales contains:
+      | country_code | brand_name | source_system_name | territory_id | sales_value | sales_month  |
+      | <cc>         | <bn>       | <ssn>             | <tid>        | <sv>        | <sm>         |
+    And t3_ttm_territory_sales contains:
+      | country_code | brand_name | source_system_name | territory_id | sales_net_price_local | fiscal_date  |
+      | <cc>         | <bn>       | <ssn>             | <tid>        | <snpl>               | <fd>         |
+    And control_table contains:
+      | source_system | country_code | brand_name |
+      | <ssn>         | <cc>         | <bn>       |
+    When the Databricks SQL query is executed to calculate actual_value
+    Then actual_value_calculation should contain:
+      | country_code | brand_name | territory_id | month | year | actual_value |
+      | <cc>         | <bn>       | <tid>        | <m>   | <y>  | <sum>        |
+
+    Examples:
+      | cc   | bn        | ssn         | tid   | sv     | sm         | snpl   | fd         | m  | y    | sum   |
+      | US   | BRAND_A   | SYSTEM_1    | T001  | 100.0  | 2023-05-01 | 50.0   | 2023-05-15 | 5  | 2023 | 150.0 |
+      | DE   | BRAND_B   | SYSTEM_2    | T002  | 200.0  | 2022-12-01 | 0.0    | 2022-12-20 | 12 | 2022 | 200.0 |
+      | FR   | BRAND_C   | SYSTEM_3    | T003  | 0.0    | 2024-01-01 | 300.0  | 2024-01-10 | 1  | 2024 | 300.0 |
+
+  Scenario Outline: Calculate actual_value when only one table has data for a given key
+    Given t3_itm_territory_sales contains:
+      | country_code | brand_name | source_system_name | territory_id | sales_value | sales_month  |
+      | <cc>         | <bn>       | <ssn>             | <tid>        | <sv>        | <sm>         |
+    And t3_ttm_territory_sales does not contain a matching record for the same country_code, brand_name, territory_id, month, and year
+    And control_table contains:
+      | source_system | country_code | brand_name |
+      | <ssn>         | <cc>         | <bn>       |
+    When the Databricks SQL query is executed to calculate actual_value
+    Then actual_value_calculation should contain:
+      | country_code | brand_name | territory_id | month | year | actual_value |
+      | <cc>         | <bn>       | <tid>        | <m>   | <y>  | <sv>         |
+
+    Examples:
+      | cc   | bn        | ssn         | tid   | sv     | sm         | m  | y    |
+      | US   | BRAND_A   | SYSTEM_1    | T001  | 100.0  | 2023-05-01 | 5  | 2023 |
+      | DE   | BRAND_B   | SYSTEM_2    | T002  | 200.0  | 2022-12-01 | 12 | 2022 |
+
+  Scenario Outline: Calculate actual_value when only t3_ttm_territory_sales has data for a given key
+    Given t3_ttm_territory_sales contains:
+      | country_code | brand_name | source_system_name | territory_id | sales_net_price_local | fiscal_date  |
+      | <cc>         | <bn>       | <ssn>             | <tid>        | <snpl>               | <fd>         |
+    And t3_itm_territory_sales does not contain a matching record for the same country_code, brand_name, territory_id, month, and year
+    And control_table contains:
+      | source_system | country_code | brand_name |
+      | <ssn>         | <cc>         | <bn>       |
+    When the Databricks SQL query is executed to calculate actual_value
+    Then actual_value_calculation should contain:
+      | country_code | brand_name | territory_id | month | year | actual_value |
+      | <cc>         | <bn>       | <tid>        | <m>   | <y>  | <snpl>       |
+
+    Examples:
+      | cc   | bn        | ssn         | tid   | snpl   | fd         | m  | y    |
+      | US   | BRAND_A   | SYSTEM_1    | T001  | 50.0   | 2023-05-15 | 5  | 2023 |
+      | DE   | BRAND_B   | SYSTEM_2    | T002  | 0.0    | 2022-12-20 | 12 | 2022 |
+
+  Scenario Outline: Exclude records where source_system_name does not exist in control_table
+    Given t3_itm_territory_sales contains:
+      | country_code | brand_name | source_system_name | territory_id | sales_value | sales_month  |
+      | <cc>         | <bn>       | <ssn>             | <tid>        | <sv>        | <sm>         |
+    And t3_ttm_territory_sales contains:
+      | country_code | brand_name | source_system_name | territory_id | sales_net_price_local | fiscal_date  |
+      | <cc>         | <bn>       | <ssn>             | <tid>        | <snpl>               | <fd>         |
+    And control_table does not contain:
+      | source_system | country_code | brand_name |
+      | <ssn>         | <cc>         | <bn>       |
+    When the Databricks SQL query is executed to calculate actual_value
+    Then actual_value_calculation should not contain any record with:
+      | country_code | brand_name | territory_id | month | year |
+      | <cc>         | <bn>       | <tid>        | <m>   | <y>  |
+
+    Examples:
+      | cc   | bn        | ssn         | tid   | sv     | sm         | snpl   | fd         | m  | y    |
+      | US   | BRAND_A   | SYSTEM_1    | T001  | 100.0  | 2023-05-01 | 50.0   | 2023-05-15 | 5  | 2023 |
+
+  Scenario Outline: Validation of output data types and not null constraints
+    Given the Databricks SQL query is executed to calculate actual_value
+    When actual_value_calculation is populated
+    Then all columns must have the following data types and constraints:
+      | column        | type   | not null |
+      | country_code  | string | true     |
+      | brand_name    | string | true     |
+      | territory_id  | string | true     |
+      | month         | string | true     |
+      | year          | string | true     |
+      | actual_value  | double | true     |
+
+  Scenario Outline: Validation of month and year extraction from date columns
+    Given t3_itm_territory_sales contains:
+      | sales_month  |
+      | <sm>         |
+    And t3_ttm_territory_sales contains:
+      | fiscal_date  |
+      | <fd>         |
+    When the Databricks SQL query is executed
+    Then the extracted month and year should be:
+      | source_table                | date_column | extracted_month | extracted_year |
+      | t3_itm_territory_sales      | <sm>        | <m1>           | <y1>           |
+      | t3_ttm_territory_sales      | <fd>        | <m2>           | <y2>           |
+
+    Examples:
+      | sm         | fd         | m1 | y1   | m2 | y2   |
+      | 2023-05-01 | 2023-05-15 | 5  | 2023 | 5  | 2023 |
+      | 2022-12-01 | 2022-12-20 | 12 | 2022 | 12 | 2022 |
+
+  Scenario: Error when sales_value or sales_net_price_local is not numeric
+    Given t3_itm_territory_sales contains a record with sales_value = 'abc'
+    Or t3_ttm_territory_sales contains a record with sales_net_price_local = 'xyz'
+    When the Databricks SQL query is executed
+    Then the record is excluded from actual_value_calculation
+    And an error is logged: "Invalid numeric value in sales_value or sales_net_price_local"
+
+  Scenario: Error when required columns are null
+    Given t3_itm_territory_sales contains a record with null in any of country_code, brand_name, territory_id, sales_month, or sales_value
+    Or t3_ttm_territory_sales contains a record with null in any of country_code, brand_name, territory_id, fiscal_date, or sales_net_price_local
+    When the Databricks SQL query is executed
+    Then the record is excluded from actual_value_calculation
+    And an error is logged: "Null value in required column"
+
+  Scenario: Exclude duplicate records in aggregation
+    Given t3_itm_territory_sales contains multiple records with the same country_code, brand_name, territory_id, month, and year
+    Or t3_ttm_territory_sales contains multiple records with the same country_code, brand_name, territory_id, month, and year
+    When the Databricks SQL query is executed
+    Then actual_value_calculation should aggregate (sum) all sales_value and sales_net_price_local for each unique combination of country_code, brand_name, territory_id, month, and year
+
+  Scenario: Output actual_value as 0.0 if both sales_value and sales_net_price_local are missing for a key
+    Given no records exist in t3_itm_territory_sales or t3_ttm_territory_sales for a given country_code, brand_name, territory_id, month, and year
+    When the Databricks SQL query is executed
+    Then actual_value_calculation should not contain a record for that key
+
+  Scenario: Validate that only records with source_system_name present in control_table are included
+    Given t3_itm_territory_sales contains a record with source_system_name = 'SYSTEM_X'
+    And control_table does not contain source_system = 'SYSTEM_X'
+    When the Databricks SQL query is executed
+    Then actual_value_calculation should not contain any record with source_system_name = 'SYSTEM_X'
+
+  Scenario: Validate that actual_value is the sum of all matching sales_value and sales_net_price_local
+    Given t3_itm_territory_sales contains:
+      | country_code | brand_name | source_system_name | territory_id | sales_value | sales_month  |
+      | US           | BRAND_A    | SYSTEM_1          | T001         | 100.0       | 2023-05-01   |
+      | US           | BRAND_A    | SYSTEM_1          | T001         | 50.0        | 2023-05-01   |
+    And t3_ttm_territory_sales contains:
+      | country_code | brand_name | source_system_name | territory_id | sales_net_price_local | fiscal_date  |
+      | US           | BRAND_A    | SYSTEM_1          | T001         | 25.0                  | 2023-05-15   |
+      | US           | BRAND_A    | SYSTEM_1          | T001         | 25.0                  | 2023-05-15   |
+    And control_table contains:
+      | source_system | country_code | brand_name |
+      | SYSTEM_1      | US           | BRAND_A    |
+    When the Databricks SQL query is executed
+    Then actual_value_calculation should contain:
+      | country_code | brand_name | territory_id | month | year | actual_value |
+      | US           | BRAND_A    | T001         | 5     | 2023 | 200.0        |
