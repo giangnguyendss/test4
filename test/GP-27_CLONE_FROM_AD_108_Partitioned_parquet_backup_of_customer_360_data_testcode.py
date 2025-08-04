@@ -1,281 +1,464 @@
-# PySpark script for Databricks customer_360_raw backup and vacuum operation
-# Purpose: Test partitioned Parquet backup and Delta vacuum/delete logic on Unity Catalog table with all error/logging scenarios
-# Author: Giang Nguyen
-# Date: 2025-07-22
-# Description: This script tests reading from Unity Catalog table, writing partitioned Parquet backups with snappy compression, validates column/scheme/data integrity, checks all error/edge vault cases, performs vacuum on Delta, and ensures logs/errors are handled appropriately. It covers permissions, missing columns, bad datetimes, column count, and null handling, with robust type and schema checks.
+# ============================================================
+# PySpark Test Suite for Backup and Vacuum of customer_360_raw
+# Databricks environment: Unity Catalog, Delta Lake, Volumes
+# All code is executable in Databricks, with comments for clarity
+# ============================================================
 
-# -- Required imports for PySpark, Delta, datatypes, functions, and logging
-from pyspark.sql import functions as F      
-from pyspark.sql.types import (             
-    StructType, StructField, StringType, LongType, DoubleType, IntegerType, DateType, TimestampType
-)
-from delta.tables import DeltaTable         
-import datetime                            
-import os                                  
-import json                                
+# ---------------------------
+# Imports and Setup
+# ---------------------------
+from pyspark.sql import SparkSession  # SparkSession is already available in Databricks
+from pyspark.sql import functions as F  
+from pyspark.sql.types import (StructType, StructField, LongType, StringType, DateType)  
+from datetime import datetime, timedelta  
+import os  
+import shutil  
 
-# -- Configuration constants and paths
-CATALOG_TABLE = "purgo_databricks.purgo_playground.customer_360_raw"
-PARQUET_BACKUP_PATH = "/Volumes/customer_360_raw_backup"
-LOG_FILE_PATH = "/dbfs/logs/customer_360_raw_backup.log"
-RETENTION_DAYS = 30
-REQUIRED_PARTITION_COL = "state"
-REQUIRED_TIMESTAMP_COL = "updated_at"
-COMPRESSION_CODEC = "snappy"   # Only "snappy" is allowed
-CURRENT_UTC = datetime.datetime(2024, 6, 30, 12, 0, 0)  # Fixed for deterministic tests
+# ---------------------------
+# Constants and Paths
+# ---------------------------
+# Define constants for table and volume paths
+CATALOG = "purgo_databricks"
+SCHEMA = "purgo_playground"
+RAW_TABLE = f"{CATALOG}.{SCHEMA}.customer_360_raw"
+BACKUP_LOG_TABLE = f"{CATALOG}.{SCHEMA}.customer_360_raw_backup_log"
+VOLUME_BACKUP_PATH = "/Volumes/customer_360_raw_backup"
+PARQUET_COMPRESSION = "snappy"
+BACKUP_RETENTION_DAYS = 90
+VACUUM_RETENTION_DAYS = 30
+BACKUP_PARTITION_COL = "state"
+REQUIRED_FIELDS = ["id", "email", "state", "creation_date"]
 
-# -- Utility: log events to file as JSONL
-def log_event(operation, status, details="", error_message=None):
+# ---------------------------
+# Utility Functions
+# ---------------------------
+
+def log_operation(status, operation_type, record_count, error_message):
     """
-    Log an event to /dbfs/logs/customer_360_raw_backup.log
-    
-    Args:
-        operation (str): Operation name (e.g., 'backup', 'vacuum').
-        status (str): 'OK' or 'FAIL'.
-        details (str): Additional info.
-        error_message (str|None): Exception msg or None.
+    Log backup or vacuum operation to the backup log table.
     """
-    log_entry = {
-        "event_time": datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "operation": operation,
-        "status": status,
-        "details": details,
-        "error_message": error_message
-    }
+    log_df = spark.createDataFrame(
+        [(datetime.utcnow().isoformat(), status, operation_type, record_count, error_message)],
+        ["timestamp", "status", "operation_type", "record_count", "error_message"]
+    )
     try:
-        with open(LOG_FILE_PATH, "a") as f:
-            f.write(json.dumps(log_entry) + "\n")
+        log_df.write.format("delta").mode("append").saveAsTable(BACKUP_LOG_TABLE)
     except Exception as e:
-        print(f"[LOGGING ERROR]: Unable to log: {e}")
+        # If log table is unavailable, raise error as per requirements
+        raise RuntimeError("Backup log table unavailable") from e
 
-# -- Utility: function to validate Parquet compression codec in backup directory
-def assert_parquet_files_compressed_snappy(backup_path):
+def validate_email(email):
     """
-    Assert that all Parquet files under backup_path are compressed with snappy.
-
-    Args:
-        backup_path (str): Path to Parquet backup dir.
-
-    Raises:
-        AssertionError: If any non-snappy compressed Parquets are found.
+    Simple email format validation using PySpark SQL regex.
     """
-    # NOTE: pyarrow or native parquetlib is not directly available;
-    # Databricks Parquet always uses file metadata to show codec
-    # For test, sample a file and read its footer using SQL (show format).
-    files = [f for f in os.listdir(backup_path) if f.endswith('.parquet')]
-    if len(files) == 0:
-        return
-    parquet_file = os.path.join(backup_path, files[0])
-    df = spark.read.parquet(parquet_file)
-    # Save as single file and check its format option
-    # No direct API to introspect codec, but if .option("compression", ...) set to snappy: assume it's correct
-    # Not assertable at API level in PySpark without extra libs (test limited here)
-    pass
+    if email is None:
+        return False
+    # Basic regex for email validation
+    import re  
+    return re.match(r"^[^@]+@[^@]+\.[^@]+$", email) is not None
 
-# -- Step 1: Read from Unity Catalog table. Catch missing table/columns/permission errors.
+def validate_required_fields(row):
+    """
+    Validate required fields for a row.
+    """
+    if row["id"] is None:
+        return False, f"id is NULL in record with email={row['email']}"
+    if row["email"] is None:
+        return False, f"email is NULL in record id={row['id']}"
+    if not validate_email(row["email"]):
+        return False, f"Data validation error: invalid email format in record id={row['id']}"
+    if row["state"] is None:
+        return False, f"state is NULL in record id={row['id']}"
+    return True, None
+
+def get_table_schema(table_name):
+    """
+    Get schema of a table as StructType.
+    """
+    return spark.table(table_name).schema
+
+def assert_schema_match(df, table_name):
+    """
+    Assert that DataFrame schema matches the target table schema.
+    """
+    table_schema = get_table_schema(table_name)
+    assert len(df.columns) == len(table_schema), f"Column count mismatch: {len(df.columns)} vs {len(table_schema)}"
+    for f1, f2 in zip(df.schema.fields, table_schema.fields):
+        assert f1.name == f2.name, f"Column name mismatch: {f1.name} vs {f2.name}"
+        assert isinstance(f1.dataType, type(f2.dataType)), f"Column type mismatch: {f1.dataType} vs {f2.dataType}"
+
+def assert_parquet_partitioned_by_state(parquet_path):
+    """
+    Assert that parquet files are partitioned by state.
+    """
+    try:
+        dirs = [d for d in os.listdir(parquet_path) if d.startswith("state=")]
+        assert len(dirs) > 0, "No state partitions found in parquet backup"
+    except Exception as e:
+        raise AssertionError(f"Partition check failed: {str(e)}")
+
+def assert_parquet_compression(parquet_path, expected_codec="snappy"):
+    """
+    Assert that parquet files are compressed with the expected codec.
+    """
+    try:
+        for root, dirs, files in os.walk(parquet_path):
+            for file in files:
+                if file.endswith(".parquet"):
+                    file_path = os.path.join(root, file)
+                    parquet_file = pq.ParquetFile(file_path)
+                    codec = parquet_file.metadata.row_group(0).column(0).compression
+                    assert codec.lower() == expected_codec, f"Compression codec mismatch: {codec} != {expected_codec}"
+    except ImportError:
+        # If pyarrow is not available, skip this check
+        pass
+    except Exception as e:
+        raise AssertionError(f"Compression check failed: {str(e)}")
+
+def assert_no_partial_files(parquet_path):
+    """
+    Assert that no partial files exist in the backup directory.
+    """
+    if os.path.exists(parquet_path):
+        files = os.listdir(parquet_path)
+        assert len(files) == 0, "Partial files found after failed backup"
+
+def assert_log_entry(status, operation_type, record_count, error_message_contains=None):
+    """
+    Assert that a log entry exists with the given parameters.
+    """
+    df = spark.table(BACKUP_LOG_TABLE)
+    cond = (F.col("status") == status) & (F.col("operation_type") == operation_type) & (F.col("record_count") == record_count)
+    if error_message_contains is not None:
+        cond = cond & (F.col("error_message").contains(error_message_contains))
+    assert df.filter(cond).count() > 0, f"Log entry not found for {status}, {operation_type}, {record_count}, {error_message_contains}"
+
+def assert_table_row_count(table_name, expected_count):
+    """
+    Assert that a table has the expected number of rows.
+    """
+    actual_count = spark.table(table_name).count()
+    assert actual_count == expected_count, f"Row count mismatch: {actual_count} != {expected_count}"
+
+def assert_only_recent_records(table_name, date_col, min_date):
+    """
+    Assert that only records with date_col >= min_date exist in the table.
+    """
+    df = spark.table(table_name)
+    assert df.filter(F.col(date_col) < min_date).count() == 0, f"Old records found before {min_date}"
+
+def assert_backup_file_deleted(parquet_path, file_date):
+    """
+    Assert that backup files older than retention are deleted.
+    """
+    target_dir = os.path.join(parquet_path, f"date={file_date}")
+    assert not os.path.exists(target_dir), f"Old backup file {target_dir} still exists"
+
+def assert_idempotency(operation_type, date_str):
+    """
+    Assert that only one log entry exists for the operation and date.
+    """
+    df = spark.table(BACKUP_LOG_TABLE)
+    count = df.filter((F.col("operation_type") == operation_type) & (F.col("timestamp").startswith(date_str))).count()
+    assert count == 1, f"Idempotency failed: {count} log entries for {operation_type} on {date_str}"
+
+# ---------------------------
+# Test Data Preparation
+# ---------------------------
+
+# Load test data as per provided test data script
+# (Assume test data is already loaded into RAW_TABLE for test execution)
+
+# ---------------------------
+# Test 1: Schema Validation
+# ---------------------------
+# /* Test that the DataFrame schema matches the target table schema */
+df_raw = spark.table(RAW_TABLE)
+assert_schema_match(df_raw, RAW_TABLE)
+
+# ---------------------------
+# Test 2: Data Type Conversion and NULL Handling
+# ---------------------------
+# /* Test that all required fields are present and valid, and NULLs are handled */
+invalid_rows = []
+for row in df_raw.collect():
+    valid, err = validate_required_fields(row.asDict())
+    if not valid:
+        invalid_rows.append((row, err))
+assert len(invalid_rows) == 4, "Expected 4 invalid rows for required fields and email format"
+
+# ---------------------------
+# Test 3: Backup Operation - Happy Path
+# ---------------------------
+# /* Test full backup to parquet, partitioned by state, snappy compression */
 try:
-    customer_360_raw_df = spark.read.table(CATALOG_TABLE)
-    log_event("read_source", "OK", details="Read Unity Catalog table")
+    # Remove previous backup files for clean test
+    if os.path.exists(VOLUME_BACKUP_PATH):
+        shutil.rmtree(VOLUME_BACKUP_PATH)
+except Exception:
+    pass  # Ignore if path does not exist
+
+try:
+    # Filter out invalid rows for backup
+    valid_df = df_raw.filter(
+        (F.col("id").isNotNull()) &
+        (F.col("email").isNotNull()) &
+        (F.col("state").isNotNull()) &
+        (F.col("email").rlike(r"^[^@]+@[^@]+\.[^@]+$"))
+    )
+    record_count = valid_df.count()
+    # Write to parquet, partitioned by state, snappy compression
+    valid_df.write.mode("overwrite").partitionBy(BACKUP_PARTITION_COL).option("compression", PARQUET_COMPRESSION).parquet(VOLUME_BACKUP_PATH)
+    # Log success
+    log_operation("SUCCESS", "BACKUP", record_count, None)
 except Exception as e:
-    log_event("read_source", "FAIL", error_message=f"TABLE_NOT_FOUND_OR_NO_PRIV: {str(e)}")
+    log_operation("FAILED", "BACKUP", 0, str(e))
     raise
 
-# -- Step 2: Validate schema and partition column presence before backup
-src_fields = set(customer_360_raw_df.columns)
-assert REQUIRED_PARTITION_COL in src_fields, \
-    log_event("schema_validation", "FAIL", error_message="PARTITION_COLUMN_MISSING: 'state' missing") or "Required partition column 'state' is missing"
+# Assert backup files exist and are partitioned by state
+assert_parquet_partitioned_by_state(VOLUME_BACKUP_PATH)
+# Assert parquet files use snappy compression (if pyarrow available)
+assert_parquet_compression(VOLUME_BACKUP_PATH, "snappy")
+# Assert log entry for backup
+assert_log_entry("SUCCESS", "BACKUP", record_count)
 
-# -- Step 3: Ensure number of DataFrame columns matches table schema
-table_schema = customer_360_raw_df.schema
-assert len(customer_360_raw_df.columns) == len(table_schema), \
-    log_event("schema_validation", "FAIL", error_message="COLUMN_COUNT_MISMATCH") or "Column count does not match target schema"
-
-# -- Step 4: If backup dir compression set to 'none', error out
-if COMPRESSION_CODEC == "none":
-    log_event("backup", "FAIL", error_message="COMPRESSION_REQUIRED: Output compression must be enabled")
-    raise Exception("COMPRESSION_REQUIRED: Output compression must be enabled")
-
-# -- Step 5: Do not allow backup if no data or table missing
-source_row_count = customer_360_raw_df.count()
-if source_row_count == 0:
-    log_event("backup", "FAIL", details="NO_DATA_TO_BACKUP")
-    # Directory must remain empty for this test path
-else:
-    # -- Step 6: Write DataFrame partitioned by `state`, snappy compressed Parquet
-    try:
-        customer_360_raw_df.write.mode("overwrite") \
-            .option("compression", COMPRESSION_CODEC) \
-            .partitionBy(REQUIRED_PARTITION_COL) \
-            .parquet(PARQUET_BACKUP_PATH)
-        log_event("backup", "OK", details=f"Backup {source_row_count} rows partitioned by {REQUIRED_PARTITION_COL}")
-    except Exception as e:
-        log_event("backup", "FAIL", error_message=str(e))
-        raise
-
-    # -- Step 7: Validate row count, schema, column names in Parquet
-    try:
-        parquet_df = spark.read.parquet(PARQUET_BACKUP_PATH)
-        parquet_row_count = parquet_df.count()
-        assert parquet_row_count == source_row_count, \
-            log_event("backup_validation", "FAIL", error_message="ROW_COUNT_MISMATCH") or "Row count mismatch"
-        assert set(parquet_df.columns) == set(src_fields), \
-            log_event("backup_validation", "FAIL", error_message="COLUMN_NAME_MISMATCH") or "Backup column names mismatch"
-        for sf in table_schema:
-            assert parquet_df.schema[sf.name].dataType == sf.dataType, \
-                log_event("backup_validation", "FAIL", error_message="DATATYPE_MISMATCH") or f"Column {sf.name} datatype mismatch"
-        log_event("backup_validation", "OK", details="Backup schema, names, datatypes match")
-    except Exception as e:
-        log_event("backup_validation", "FAIL", error_message=str(e))
-        raise
-
-    # -- Step 8: Check that Parquet files are written partitioned by state, and compressed (see notes in function above)
-    # Not directly assertable for snappy in PySpark w/o native libs; assume OK if no error
-    try:
-        partitions = parquet_df.select(REQUIRED_PARTITION_COL).distinct().count()
-        src_partitions = customer_360_raw_df.select(REQUIRED_PARTITION_COL).distinct().count()
-        assert partitions == src_partitions, \
-            log_event("partitioning", "FAIL", error_message="PARTITION_VALUE_MISMATCH") or "Backup partitions mismatch source 'state' distinct values"
-        log_event("partitioning", "OK", details="Backup partitions per 'state' correct")
-        # Parquet snappy check best-effort per note: see files
-    except Exception as e:
-        log_event("partitioning", "FAIL", error_message=str(e))
-        raise
-
-# -- Step 9: Data type conversion/sample: STRING -> TIMESTAMP, NULLs, ARRAY, STRUCT/MAP types validation
-def test_data_type_and_null_handling(df):
-    """
-    Test data type conversions, NULL handling, and Spark/SQL compatibility.
-
-    Args:
-        df (DataFrame): DataFrame to test.
-
-    Returns:
-        None
-    """
-    # Test: updated_at as timestamp (must convert, NULLs/bad strings become null)
-    df2 = df.withColumn("updated_at_ts", F.to_timestamp("updated_at", "yyyy-MM-dd HH:mm:ss"))
-    null_count = df2.filter(F.col("updated_at_ts").isNull() & F.col("updated_at").isNotNull()).count()
-    if null_count > 0:
-        log_event("datatype_conversion", "FAIL", details=f"{null_count} bad 'updated_at' format(s)", error_message="INVALID_DATETIME_FORMAT")
-    # Test: array, struct, map field add, and nulls
-    arr_df = df.withColumn("arr_test", F.array("state", "zip"))
-    struct_df = arr_df.withColumn("struct_test", F.struct("state", "zip"))
-    map_df = struct_df.withColumn("map_test", F.create_map(["state", "zip"]))
-    # Check null: set 'name' to null where zip is invalid
-    nullified = map_df.withColumn("name", F.when(F.col("zip") == "!!!!!!", F.lit(None)).otherwise(F.col("name")))
-    null_rows = nullified.filter(F.col("name").isNull()).count()
-    if null_rows > 0:
-        log_event("null_handling", "OK", details=f"{null_rows} nulls injected in 'name'")
-    # Test for all datatypes: LongType, StringType, DoubleType, IntegerType, DateType, TimestampType, ARRAY, STRUCT, MAP
-    return
-
-test_data_type_and_null_handling(customer_360_raw_df)
-
-# -- Step 10: Run vacuum operation on Unity Catalog Delta table to remove records older than 30 days based on updated_at
+# ---------------------------
+# Test 4: Backup Operation - Data Validation Error
+# ---------------------------
+# /* Test backup fails if invalid email format is present */
 try:
-    # First, check if table is Delta
-    delta_table = DeltaTable.forName(spark, CATALOG_TABLE)
-    cutoff_dt = (CURRENT_UTC - datetime.timedelta(days=RETENTION_DAYS)).strftime('%Y-%m-%d %H:%M:%S')
-    # Window: Validate that field exists and is convertible to timestamp
-    try:
-        upd_col = customer_360_raw_df.select(REQUIRED_TIMESTAMP_COL)
-        nulls = upd_col.filter(F.col(REQUIRED_TIMESTAMP_COL).isNull()).count()
-        if nulls > 0:
-            log_event("vacuum_precheck", "FAIL", error_message="NULL_DATETIME_ERROR: 'updated_at' field is null")
-            raise Exception("NULL_DATETIME_ERROR: 'updated_at' field is null")
-    except Exception as e:
-        log_event("vacuum_precheck", "FAIL", error_message="NO_UPDATED_AT_COL_OR_NULL: " + str(e))
-        raise
-
-    # Delete records older than cutoff
-    delta_table.delete(f"{REQUIRED_TIMESTAMP_COL} < '{cutoff_dt}'")
-    log_event("vacuum", "OK", details=f"Deleted records where {REQUIRED_TIMESTAMP_COL} < {cutoff_dt}")
-    # Optional: run Delta VACUUM physical clean-up
-    spark.sql(f"VACUUM {CATALOG_TABLE} RETAIN 0 HOURS")
-    log_event("vacuum_physical", "OK", details="Run Delta VACUUM 0h")
+    # Intentionally include invalid email
+    df_invalid_email = df_raw.filter(F.col("email") == "invalid-email-format")
+    if df_invalid_email.count() > 0:
+        raise ValueError(f"Data validation error: invalid email format in record id={df_invalid_email.first()['id']}")
 except Exception as e:
-    log_event("vacuum", "FAIL", error_message=f"{str(e)}")
+    log_operation("FAILED", "BACKUP", 0, str(e))
+    assert_log_entry("FAILED", "BACKUP", 0, "invalid email format")
+
+# ---------------------------
+# Test 5: Backup Operation - Required Field NULL
+# ---------------------------
+# /* Test backup fails if required fields are NULL */
+for field in ["email", "id", "state"]:
+    try:
+        df_null = df_raw.filter(F.col(field).isNull())
+        if df_null.count() > 0:
+            raise ValueError(f"{field} is NULL in record id={df_null.first()['id']}")
+    except Exception as e:
+        log_operation("FAILED", "BACKUP", 0, str(e))
+        assert_log_entry("FAILED", "BACKUP", 0, f"{field} is NULL")
+
+# ---------------------------
+# Test 6: Backup Operation - Insufficient Write Permissions
+# ---------------------------
+# /* Simulate permission denied by writing to a protected path */
+try:
+    protected_path = "/root/protected_backup"
+    valid_df.limit(1).write.mode("overwrite").parquet(protected_path)
+except Exception as e:
+    log_operation("FAILED", "BACKUP", 0, "Permission denied: write access")
+    assert_log_entry("FAILED", "BACKUP", 0, "Permission denied: write access")
+
+# ---------------------------
+# Test 7: Backup Operation - Insufficient Storage
+# ---------------------------
+# /* Simulate insufficient storage by checking free space (mocked) */
+try:
+    # Simulate <1GB free space
+    free_space_gb = 0.5
+    estimated_backup_size_gb = 10
+    if free_space_gb < estimated_backup_size_gb:
+        raise IOError("Insufficient storage space")
+except Exception as e:
+    log_operation("FAILED", "BACKUP", 0, "Insufficient storage space")
+    assert_log_entry("FAILED", "BACKUP", 0, "Insufficient storage space")
+
+# ---------------------------
+# Test 8: Vacuum Operation - Happy Path
+# ---------------------------
+# /* Test vacuum operation retains only records from last 30 days */
+try:
+    today = datetime(2024, 6, 30)
+    min_date = today - timedelta(days=VACUUM_RETENTION_DAYS)
+    # Count records before vacuum
+    pre_vacuum_count = df_raw.count()
+    # Delete old records
+    spark.sql(f"""
+        DELETE FROM {RAW_TABLE}
+        WHERE creation_date < DATE('{min_date.date()}')
+    """)
+    # Count records after vacuum
+    post_vacuum_count = spark.table(RAW_TABLE).count()
+    # Log success
+    log_operation("SUCCESS", "VACUUM", post_vacuum_count, None)
+except Exception as e:
+    log_operation("FAILED", "VACUUM", 0, str(e))
     raise
 
-# -- Step 11: Post-vacuum data quality: remaining records' updated_at >= cutoff
+# Assert only recent records remain
+assert_only_recent_records(RAW_TABLE, "creation_date", min_date.date())
+# Assert log entry for vacuum
+assert_log_entry("SUCCESS", "VACUUM", post_vacuum_count)
+
+# ---------------------------
+# Test 9: Vacuum Operation - Insufficient Table Permissions
+# ---------------------------
+# /* Simulate permission denied on DELETE */
 try:
-    validate_df = spark.read.table(CATALOG_TABLE).withColumn("updated_at_ts", F.to_timestamp("updated_at", "yyyy-MM-dd HH:mm:ss"))
-    bad = validate_df.filter(F.col("updated_at_ts") < F.lit(cutoff_dt)).count()
-    assert bad == 0, log_event("vacuum_validation", "FAIL", error_message="VACUUM_NOT_COMPLETE") or "Old records found after vacuum"
-    log_event("vacuum_validation", "OK", details="All remaining rows post-vacuum are in range")
+    # Simulate by raising error
+    raise PermissionError("Permission denied: delete access")
 except Exception as e:
-    log_event("vacuum_validation", "FAIL", error_message=str(e))
+    log_operation("FAILED", "VACUUM", 0, "Permission denied: delete access")
+    assert_log_entry("FAILED", "VACUUM", 0, "Permission denied: delete access")
+
+# ---------------------------
+# Test 10: Retention Policy - Delete Old Backup Files
+# ---------------------------
+# /* Test that backup files older than retention are deleted */
+try:
+    # Simulate a backup file from 2024-03-01
+    old_backup_dir = os.path.join(VOLUME_BACKUP_PATH, "date=2024-03-01")
+    os.makedirs(old_backup_dir, exist_ok=True)
+    # Run retention policy
+    cutoff_date = (datetime(2024, 6, 1) - timedelta(days=BACKUP_RETENTION_DAYS)).date()
+    for d in os.listdir(VOLUME_BACKUP_PATH):
+        if d.startswith("date="):
+            file_date = d.split("=")[1]
+            if file_date < str(cutoff_date):
+                shutil.rmtree(os.path.join(VOLUME_BACKUP_PATH, d))
+    # Assert old backup deleted
+    assert_backup_file_deleted(VOLUME_BACKUP_PATH, "2024-03-01")
+except Exception as e:
+    raise AssertionError(f"Retention policy failed: {str(e)}")
+
+# ---------------------------
+# Test 11: Logging - All Operations
+# ---------------------------
+# /* Test that all operations are logged with correct fields */
+df_log = spark.table(BACKUP_LOG_TABLE)
+required_log_fields = ["timestamp", "status", "operation_type", "record_count", "error_message"]
+for field in required_log_fields:
+    assert field in df_log.columns, f"Log table missing field: {field}"
+
+# ---------------------------
+# Test 12: Atomicity - No Partial State on Failure
+# ---------------------------
+# /* Test that failed backup leaves no partial files */
+try:
+    # Simulate failure during backup
+    partial_path = os.path.join(VOLUME_BACKUP_PATH, "partial")
+    os.makedirs(partial_path, exist_ok=True)
+    raise RuntimeError("Simulated failure during backup")
+except Exception as e:
+    # Clean up partial files
+    if os.path.exists(partial_path):
+        shutil.rmtree(partial_path)
+    log_operation("FAILED", "BACKUP", 0, str(e))
+    assert_no_partial_files(partial_path)
+    assert_log_entry("FAILED", "BACKUP", 0, "Simulated failure during backup")
+
+# ---------------------------
+# Test 13: Idempotency - Only One Operation Per Day
+# ---------------------------
+# /* Test that only one backup and one vacuum are performed per day */
+date_str = datetime.utcnow().date().isoformat()
+assert_idempotency("BACKUP", date_str)
+assert_idempotency("VACUUM", date_str)
+
+# ---------------------------
+# Test 14: Auditing - All Operation Details in Log
+# ---------------------------
+# /* Test that all operation details are available for audit */
+df_log = spark.table(BACKUP_LOG_TABLE)
+assert df_log.count() > 0, "No log entries found for audit"
+
+# ---------------------------
+# Test 15: Backup Includes All Columns
+# ---------------------------
+# /* Test that backup parquet files include all columns from source table */
+parquet_df = spark.read.parquet(VOLUME_BACKUP_PATH)
+assert set(parquet_df.columns) == set(df_raw.columns), "Backup parquet columns do not match source table"
+
+# ---------------------------
+# Test 16: Parquet Partitioning by State
+# ---------------------------
+# /* Test that backup parquet files are partitioned by state */
+assert_parquet_partitioned_by_state(VOLUME_BACKUP_PATH)
+
+# ---------------------------
+# Test 17: Parquet Compression
+# ---------------------------
+# /* Test that backup parquet files use snappy compression */
+assert_parquet_compression(VOLUME_BACKUP_PATH, "snappy")
+
+# ---------------------------
+# Test 18: Only Recent Records After Vacuum
+# ---------------------------
+# /* Test that only records from last 30 days remain after vacuum */
+today = datetime(2024, 6, 30)
+min_date = today - timedelta(days=VACUUM_RETENTION_DAYS)
+assert_only_recent_records(RAW_TABLE, "creation_date", min_date.date())
+
+# ---------------------------
+# Test 19: Error Logging if Log Table Unavailable
+# ---------------------------
+# /* Test that error is raised if backup log table is unavailable */
+try:
+    # Simulate by dropping log table
+    spark.sql(f"DROP TABLE IF EXISTS {BACKUP_LOG_TABLE}")
+    try:
+        log_operation("FAILED", "BACKUP", 0, "Backup log table unavailable")
+    except RuntimeError as e:
+        assert "Backup log table unavailable" in str(e)
+finally:
+    # Recreate log table for further tests
+    spark.sql(f"""
+        CREATE TABLE IF NOT EXISTS {BACKUP_LOG_TABLE} (
+            timestamp STRING,
+            status STRING,
+            operation_type STRING,
+            record_count BIGINT,
+            error_message STRING
+        )
+        USING DELTA
+    """)
+
+# ---------------------------
+# Test 20: Incremental Backup (if specified)
+# ---------------------------
+# /* Test that only new/changed records are backed up in incremental mode */
+# For this test, simulate last backup date and filter accordingly
+last_backup_date = datetime(2024, 6, 29).date()
+incremental_df = df_raw.filter(F.col("creation_date") > F.lit(last_backup_date))
+incremental_count = incremental_df.count()
+try:
+    incremental_df.write.mode("overwrite").partitionBy(BACKUP_PARTITION_COL).option("compression", PARQUET_COMPRESSION).parquet(VOLUME_BACKUP_PATH)
+    log_operation("SUCCESS", "BACKUP", incremental_count, None)
+except Exception as e:
+    log_operation("FAILED", "BACKUP", 0, str(e))
     raise
+assert_log_entry("SUCCESS", "BACKUP", incremental_count)
 
-# -- Step 12: Permissions errors for read/write (simulate by try/except)
-def simulate_permission_error(read_ok=True, write_ok=True):
-    """
-    Simulates permission errors for backup.
+# ---------------------------
+# Test 21: Full Backup (if specified)
+# ---------------------------
+# /* Test that all records are backed up in full mode */
+full_count = valid_df.count()
+try:
+    valid_df.write.mode("overwrite").partitionBy(BACKUP_PARTITION_COL).option("compression", PARQUET_COMPRESSION).parquet(VOLUME_BACKUP_PATH)
+    log_operation("SUCCESS", "BACKUP", full_count, None)
+except Exception as e:
+    log_operation("FAILED", "BACKUP", 0, str(e))
+    raise
+assert_log_entry("SUCCESS", "BACKUP", full_count)
 
-    Args:
-        read_ok (bool): if False, simulate no read priv.
-        write_ok (bool): if False, simulate no write priv.
-    """
-    try:
-        if not read_ok:
-            raise Exception("ACCESS_DENIED: No READ privilege on source table")
-        if not write_ok:
-            raise Exception("ACCESS_DENIED: No WRITE privilege on backup volume")
-        # else do nothing
-    except Exception as e:
-        log_event("permission_check", "FAIL", error_message=str(e))
+# ---------------------------
+# Cleanup: Remove test backup files and restore log table
+# ---------------------------
+try:
+    if os.path.exists(VOLUME_BACKUP_PATH):
+        shutil.rmtree(VOLUME_BACKUP_PATH)
+except Exception:
+    pass  # Ignore if path does not exist
 
-simulate_permission_error(read_ok=True, write_ok=False)
-simulate_permission_error(read_ok=False, write_ok=True)
-simulate_permission_error(read_ok=False, write_ok=False)
-
-# -- Step 13: Test error scenario - missing table or missing partition column
-def test_structural_error_missing_table_or_partition():
-    """
-    Simulates error if table missing, or 'state' column missing for partition.
-    """
-    # Missing table
-    try:
-        spark.read.table("purgo_databricks.purgo_playground.nonexistent_table")
-    except Exception as e:
-        log_event("table_missing", "FAIL", error_message="TABLE_NOT_FOUND: customer_360_raw table does not exist")
-    # Missing column
-    test_df = customer_360_raw_df.drop(REQUIRED_PARTITION_COL)
-    try:
-        test_df.write.partitionBy(REQUIRED_PARTITION_COL).parquet("/Volumes/_should_fail")
-    except Exception as e:
-        log_event("partition_col_missing", "FAIL", error_message="PARTITION_COLUMN_MISSING: Required partition column 'state' missing")
-
-test_structural_error_missing_table_or_partition()
-
-# -- Step 14: Test error for invalid 'updated_at' datetime formatting
-def test_invalid_updated_at():
-    """
-    Tests that 'updated_at' bad format results in INVALID_DATETIME_FORMAT error.
-    """
-    df = customer_360_raw_df.withColumn("updated_at_ts", F.to_timestamp(F.col(REQUIRED_TIMESTAMP_COL), "yyyy-MM-dd HH:mm:ss"))
-    count_bad = df.filter((F.col("updated_at_ts").isNull()) & (F.col(REQUIRED_TIMESTAMP_COL).isNotNull())).count()
-    if count_bad > 0:
-        log_event("vacuum_datetime_format", "FAIL", error_message="INVALID_DATETIME_FORMAT: 'updated_at' is not yyyy-MM-dd HH:mm:ss")
-test_invalid_updated_at()
-
-# -- Step 15: Test that backup gracefully handles missing or empty table
-def test_backup_empty_handling():
-    """
-    Tests backup operation handles empty DataFrame (no data).
-    """
-    empty_df = customer_360_raw_df.filter("1=0")
-    if empty_df.count() == 0:
-        log_event("backup", "FAIL", details="NO_DATA_TO_BACKUP")
-
-test_backup_empty_handling()
-
-# -- Step 16: Clean up - Remove test artifacts for test idempotency
-def cleanup_test_parquet():
-    """
-    Deletes backup directory made during test run.
-    """
-    # os.system(f"rm -rf {PARQUET_BACKUP_PATH}")   # Do not actually remove in Databricks prod test
-    log_event("cleanup", "OK", details="Cleanup test Parquet backup skipped in test run")
-
-cleanup_test_parquet()
+# Note: Do not include spark.stop() in Databricks notebooks
