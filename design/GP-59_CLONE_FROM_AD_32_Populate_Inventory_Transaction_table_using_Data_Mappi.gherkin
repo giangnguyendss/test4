@@ -1,222 +1,213 @@
-Feature: Inventory Transaction Table (f_inv_movmnt) SQL Logic and Data Mapping
+Feature: Inventory Transaction Table ETL Logic and Data Validation
 
-  The system must populate the f_inv_movmnt table in purgo_playground schema using the field mappings and business rules defined in Inventory Txn XPY.xlsx. The logic must ensure correct joins, data transformations, default handling, and error management as per the specification.
+  The system must populate the purgo_playground.f_inv_movmnt table using SQL-based ETL logic as per the provided field mappings, transformation rules, and join conditions. The process must ensure data integrity, correct field population, and error handling for missing or invalid data.
 
   Background:
-    Given the following source tables exist in schema purgo_playground:
-      | Table   | Columns (partial)                                                                                 |
-      | PSEK    | tanpt, pklnr, pjagr, zeipe, dwart, patnr, perks, tgort, ckarg, lzbep, lifdr, sdauf, dunnr, ...   |
-      | PCHK    | tanpt, patnr, perks, tgort, ckarg, irsda, ofdat, tumlm, tinsm, peinm, tspem, tlabs, ...          |
-      | PARL    | tanpt, patnr, perks, tgort, lmlme, lnsme, linme, spele, lalst, ...                               |
-      | PBEV    | patnr, dwkey, xprsv, xtprs, peinl, perpr, ...                                                    |
-      | L009T   | perks, tgort, ...                                                                                |
-      | PARA    | tanpt, patnr, ptart, ...                                                                         |
-      | VBAX    | tanpt, patnr, perks, vpelm, dunnr, ...                                                           |
-    And all joins and filters are applied as per the mapping specification
-    And all string joins on patnr must use trimmed values
-    And the process is a full reload unless otherwise specified
+    Given the source tables PSEK, PCHK, PARL, PBEV, L009T, PARA, and VBAX are available in the purgo_playground schema
+    And all joins are performed as per the mapping:
+      | Join Type | Source Table | Join Condition                                                                                 |
+      | left      | PCHK         | pchk.TANPT = PSEK.TANPT AND pchk.PKLNR = PSEK.PKLNR                                          |
+      | left      | PARL         | psek.perks = parl.perks                                                                       |
+      | left      | PBEV         | trim(psek.patnr) = trim(pbev.patnr) and psek.perks = pbev.dwkey                              |
+      | left      | L009T        | parl.perks = l009t.perks and parl.tgort = l009t.tgort                                        |
+      | left      | PARA         | pchk.tanpt = para.tanpt and pchk.patnr = para.patnr                                          |
+      | left      | VBAX         | vbax.tanpt = parl.tanpt AND vbax.patnr = parl.patnr AND vbax.perks = parl.perks              |
+    And all string join keys are trimmed as required
+    And PARA is filtered to only include records where PRBHA begins with "XPY"
 
-  Scenario Outline: Successful population of f_inv_movmnt with valid source data (Happy Path)
-    Given a PSEK record with pklnr="<pklnr>", zeipe="<zeipe>", pjagr="<pjagr>", patnr="<patnr>", perks="<perks>", tgort="<tgort>", dwart="<dwart>", lzbep="<lzbep>", lifdr="<lifdr>", sdauf="<sdauf>", dunnr="<dunnr>"
-    And a matching PCHK record with tanpt="<tanpt>", pklnr="<pklnr>", ckarg="<ckarg>", tumlm=<tumlm>, tinsm=<tinsm>, peinm=<peinm>, tspem=<tspem>, tlabs=<tlabs>, irsda="<irsda>", ofdat="<ofdat>"
-    And a matching PARL record with perks="<perks>", tgort="<tgort>", lmlme=<lmlme>, lnsme=<lnsme>, linme=<linme>, spele=<spele>, lalst=<lalst>
-    And a matching PBEV record with patnr="<patnr>", dwkey="<perks>", xprsv="<xprsv>", xtprs=<xtprs>, peinl=<peinl>, perpr=<perpr>
-    And a matching PARA record with tanpt="<tanpt>", patnr="<patnr>", ptart="<ptart>"
-    And a matching L009T record with perks="<perks>", tgort="<tgort>"
-    When the SQL logic is executed
-    Then a record is inserted into f_inv_movmnt with:
-      | txn_id                | "<pklnr>|<zeipe>|<pjagr>"                                 |
-      | inv_loc               | "<tgort>"                                                |
-      | financial_qty         | <expected_financial_qty>                                 |
-      | net_qty               | <expected_net_qty>                                       |
-      | expired_dt            | "<expected_expired_dt>"                                  |
-      | item_nbr              | "<patnr>"                                                |
-      | unit_cost             | <expected_unit_cost>                                     |
-      | uom_rate              | 0.76                                                     |
-      | plant_loc_cd          | "<perks>"                                                |
-      | inv_stock_reference   | "<expected_inv_stock_reference>"                         |
-      | stock_type            | "<expected_stock_type>"                                  |
-      | qty_on_hand           | <expected_net_qty>                                       |
-      | qty_shipped           | <expected_financial_qty> - <expected_net_qty>            |
-      | cancel_dt             | null                                                     |
-      | flag_active           | "<expected_flag_active>"                                 |
-      | crt_dt                | current timestamp                                        |
-      | updt_dt               | current timestamp                                        |
-    And all values conform to the data types and formats specified
+  Scenario Outline: Successful population of f_inv_movmnt with valid data
+    Given a PSEK record with PKLNR = "<PKLNR>", ZEIPE = "<ZEIPE>", PJAGR = "<PJAGR>", patnr = "<patnr>", perks = "<perks>", tgort = "<tgort>", dwart = "<dwart>", lzbep = "<lzbep>", lifdr = "<lifdr>", sdauf = "<sdauf>", dunnr = "<dunnr>"
+    And a matching PCHK record with TANPT = "<TANPT>", PKLNR = "<PKLNR>", ckarg = "<ckarg>", tumlm = <tumlm>, tinsm = <tinsm>, peinm = <peinm>, tspem = <tspem>, tlabs = <tlabs>, ofdat = "<ofdat>"
+    And a matching PARL record with perks = "<perks>", tgort = "<tgort>", lmlme = <lmlme>, lnsme = <lnsme>, linme = <linme>, spele = <spele>, lalst = <lalst>
+    And a matching PBEV record with patnr = "<patnr>", dwkey = "<perks>", xprsv = "<xprsv>", xtprs = <xtprs>, perpr = <perpr>, peinl = <peinl>
+    And a matching PARA record with tanpt = "<TANPT>", patnr = "<patnr>", ptart = "<ptart>", prbha = "<prbha>"
+    When the ETL process runs
+    Then a record is created in f_inv_movmnt with:
+      | txn_id              | "<PKLNR>|<ZEIPE>|<PJAGR>" |
+      | inv_loc             | "<tgort>"                |
+      | financial_qty       | <expected_financial_qty> |
+      | net_qty             | <expected_net_qty>       |
+      | expired_dt          | "<expected_expired_dt>"  |
+      | item_nbr            | "<patnr>"                |
+      | unit_cost           | <expected_unit_cost>     |
+      | uom_rate            | 0.76                     |
+      | plant_loc_cd        | "<perks>"                |
+      | inv_stock_reference | "<expected_inv_stock_reference>" |
+      | stock_type          | "<expected_stock_type>"  |
+      | qty_on_hand         | <expected_net_qty>       |
+      | qty_shipped         | <expected_qty_shipped>   |
+      | cancel_dt           | null                     |
+      | flag_active         | "<expected_flag_active>" |
+      | crt_dt              | <current_timestamp>      |
+      | updt_dt             | <current_timestamp>      |
 
     Examples:
-      | pklnr | zeipe | pjagr | patnr   | perks | tgort | dwart | lzbep | lifdr   | sdauf   | dunnr   | tanpt | ckarg | tumlm | tinsm | peinm | tspem | tlabs | irsda     | ofdat     | lmlme | lnsme | linme | spele | lalst | xprsv | xtprs | peinl | perpr | ptart | expected_financial_qty | expected_net_qty | expected_expired_dt | expected_unit_cost | expected_inv_stock_reference | expected_stock_type | expected_flag_active |
-      | 1001  | 01    | 200   | ABC123  | PL01  | L001  | AA    | B     | SUPP001 |         |         | T01   | X1    | 10    | 5     | 2     | 1     | 0.5   | 20240601   | 20240610  | 8     | 4     | 1     | 0.5   | 0.2   | S     | 100   | 2     | 200   | FERT  | 18.5                  | 18.5             | 20240610            | 50.00              | SUPP001                    | FG                 | yes                 |
-      | 1002  | 02    | 201   | XYZ789  | PL02  | L002  | BB    | L     |         | ORD001  |         | T02   |       |       |       |       |       |       | 20240602   | 20240611  | 7     | 3     | 2     | 0.3   | 0.1   | V     | 0     | 1     | 100   | ROH   | 12.4                  | 12.4             | 20240611            | 100.00             | <VBAX_DUNNR>                | RAW                | yes                 |
+      | PKLNR | ZEIPE | PJAGR | patnr   | perks | tgort | dwart | lzbep | lifdr   | sdauf   | dunnr   | TANPT | ckarg | tumlm | tinsm | peinm | tspem | tlabs | ofdat     | lmlme | lnsme | linme | spele | lalst | xprsv | xtprs | perpr | peinl | ptart | prbha    | expected_financial_qty | expected_net_qty | expected_expired_dt | expected_unit_cost | expected_inv_stock_reference | expected_stock_type | expected_qty_shipped | expected_flag_active |
+      | 10001 | 01    | 0001  | ABC123  | 001   | L001  | RX    | B     | SUPP001 |         |         | T001  | 12345 | 10    | 5     | 2     | 1     | 2     | 20240101   | 20    | 10    | 5     | 2     | 3     | S     | 100   | 200   | 10    | FERT  | XPY-001  | 20                  | 20               | 20240101            | 10.00              | SUPP001                     | FG                 | 0                   | no                  |
+      | 10002 | 02    | 0002  | DEF456  | 002   | L002  | PX    | L     |         | SO123   |         | T002  |       | 8     | 4     | 1     | 0     | 1     | 20240102   | 15    | 7     | 3     | 1     | 2     | V     | 0     | 150   | 5     | ROH   | XPY-002  | 14                  | 28               | 20240102            | 30.00              | <VBAX_DUNNR_for_SO123>       | RAW                | 0                   | no                  |
+      | 10003 | 03    | 0003  | GHI789  | 003   | L003  | TX    |       |         |         |         | T003  |       | 0     | 0     | 0     | 0     | 0     |            | 0     | 0     | 0     | 0     | 0     | S     | 0     | 0     | 1     | HALB  | XPY-003  | 0                   | 0                | 99991231            | 0.00               | None                         | WIP                | 0                   | no                  |
 
-  Scenario: Default value handling for missing inv_loc
-    Given a PSEK record with tgort as null
-    When the SQL logic is executed
-    Then the inv_loc field in f_inv_movmnt is set to "none"
+  Scenario: Default values are set when source fields are missing
+    Given a PSEK record with PKLNR = "20001", ZEIPE = "01", PJAGR = "0001", patnr = "JKL012", perks = "004", tgort is null, dwart is null, lzbep is null, lifdr is null, sdauf is null, dunnr is null
+    And no matching PCHK, PARL, PBEV, PARA, or VBAX records
+    When the ETL process runs
+    Then a record is created in f_inv_movmnt with:
+      | txn_id              | "20001|01|0001" |
+      | inv_loc             | "none"         |
+      | financial_qty       | 0              |
+      | net_qty             | 0              |
+      | expired_dt          | "99991231"     |
+      | item_nbr            | "JKL012"       |
+      | unit_cost           | 0.00           |
+      | uom_rate            | 0.76           |
+      | plant_loc_cd        | "none"         |
+      | inv_stock_reference | "None"         |
+      | stock_type          | "OT"           |
+      | qty_on_hand         | 0              |
+      | qty_shipped         | 0              |
+      | cancel_dt           | null           |
+      | flag_active         | "no"           |
+      | crt_dt              | <current_timestamp> |
+      | updt_dt             | <current_timestamp> |
 
-  Scenario: Default value handling for missing financial_qty
-    Given no matching PCHK or PARL records for a PSEK record
-    When the SQL logic is executed
-    Then the financial_qty field in f_inv_movmnt is set to 0
-
-  Scenario: Default value handling for missing net_qty
-    Given no matching PCHK or PARL records for a PSEK record
-    When the SQL logic is executed
-    Then the net_qty field in f_inv_movmnt is set to 0
-
-  Scenario: Default value handling for missing expired_dt
-    Given no matching PCHK record for a PSEK record
-    When the SQL logic is executed
-    Then the expired_dt field in f_inv_movmnt is set to "99991231"
-
-  Scenario: Default value handling for missing unit_cost
-    Given no matching PBEV record for a PSEK record
-    When the SQL logic is executed
-    Then the unit_cost field in f_inv_movmnt is set to null
-
-  Scenario: Default value handling for missing uom_rate
-    Given any PSEK record
-    When the SQL logic is executed
-    Then the uom_rate field in f_inv_movmnt is set to 0.76
-
-  Scenario: Default value handling for missing plant_loc_cd
-    Given a PSEK record with perks as null
-    When the SQL logic is executed
-    Then the plant_loc_cd field in f_inv_movmnt is set to "none"
-
-  Scenario Outline: inv_stock_reference logic for LZBEP and related fields
-    Given a PSEK record with lzbep="<lzbep>", lifdr="<lifdr>", dunnr="<dunnr>", sdauf="<sdauf>"
-    And a matching VBAX record with vpelm="<sdauf>", dunnr="<vbax_dunnr>"
-    When the SQL logic is executed
-    Then the inv_stock_reference field in f_inv_movmnt is set to "<expected_inv_stock_reference>"
+  Scenario Outline: Error handling for invalid or conflicting data
+    Given a PSEK record with PKLNR = "<PKLNR>", ZEIPE = "<ZEIPE>", PJAGR = "<PJAGR>", patnr = "<patnr>", perks = "<perks>", tgort = "<tgort>", dwart = "<dwart>", lzbep = "<lzbep>", lifdr = "<lifdr>", sdauf = "<sdauf>", dunnr = "<dunnr>"
+    And multiple matching PCHK records with the same TANPT and PKLNR
+    When the ETL process runs
+    Then the process logs an error "Duplicate PCHK records found for PKLNR <PKLNR> and TANPT <TANPT>"
+    And no record is created in f_inv_movmnt for txn_id "<PKLNR>|<ZEIPE>|<PJAGR>"
 
     Examples:
-      | lzbep | lifdr   | dunnr   | sdauf   | vbax_dunnr | expected_inv_stock_reference |
-      | B     | SUPP001 |         |         |            | SUPP001                      |
-      | B     |         |         |         |            | none                         |
-      | L     |         | DUN001  |         |            | DUN001                       |
-      | L     |         |         | ORD001  | VBAXSUPP   | VBAXSUPP                     |
-      | L     |         |         |         |            | none                         |
-      | X     |         |         |         |            | none                         |
+      | PKLNR | ZEIPE | PJAGR | patnr  | perks | tgort | dwart | lzbep | lifdr | sdauf | dunnr | TANPT |
+      | 30001 | 01    | 0001  | MNO345 | 005   | L005  | RX    | B     | SUPP2 |       |       | T005  |
 
-  Scenario Outline: stock_type mapping from PARA.ptart
-    Given a PARA record with ptart="<ptart>"
-    When the SQL logic is executed
-    Then the stock_type field in f_inv_movmnt is set to "<expected_stock_type>"
+  Scenario: Handling of expired_dt and expired_qt field mapping ambiguity
+    Given the f_inv_movmnt table schema contains "expired_qt" but the mapping refers to "expired_dt"
+    When the ETL process runs
+    Then the process logs an error "Field mapping ambiguity: expired_dt in mapping, expired_qt in schema"
+    And the ETL process is halted until clarification is provided
 
-    Examples:
-      | ptart | expected_stock_type |
-      | FERT  | FG                 |
-      | ROH   | RAW                |
-      | HALB  | WIP                |
-      | NULL  | OT                 |
-      | ABC   | OT                 |
+  Scenario: Validation of primary key uniqueness for txn_id
+    Given multiple PSEK records that would result in the same txn_id value
+    When the ETL process runs
+    Then the process logs an error "Duplicate txn_id detected: <txn_id>"
+    And only one record is inserted for the duplicate txn_id, or the process is halted based on business rules
 
-  Scenario: qty_on_hand equals net_qty
-    Given a calculated net_qty value of 15.5
-    When the SQL logic is executed
-    Then the qty_on_hand field in f_inv_movmnt is set to 15.5
+  Scenario: Validation of stock_type mapping
+    Given a PARA record with ptart = "<ptart>"
+    When the ETL process runs
+    Then the stock_type field in f_inv_movmnt is set as follows:
+      | ptart | stock_type |
+      | FERT  | FG         |
+      | ROH   | RAW        |
+      | HALB  | WIP        |
+      | <other> | OT       |
 
-  Scenario: qty_shipped calculation
-    Given a calculated financial_qty of 20 and net_qty of 15
-    When the SQL logic is executed
-    Then the qty_shipped field in f_inv_movmnt is set to 5
-
-  Scenario: cancel_dt logic for missing mantr in current data
-    Given a record present in yesterday's data but not in today's data
-    When the SQL logic is executed
-    Then the cancel_dt field in f_inv_movmnt is set to today's date in yyyymmdd format
-
-  Scenario Outline: flag_active logic based on dwart
-    Given a PSEK record with dwart="<dwart>"
-    When the SQL logic is executed
-    Then the flag_active field in f_inv_movmnt is set to "<expected_flag_active>"
+  Scenario Outline: Validation of flag_active logic
+    Given a PSEK record with dwart = "<dwart>"
+    When the ETL process runs
+    Then the flag_active field is set to "<expected_flag_active>"
 
     Examples:
       | dwart | expected_flag_active |
       | RX    | no                  |
       | TX    | no                  |
       | PX    | no                  |
-      | AA    | yes                 |
+      | AB    | yes                 |
       | null  | no                  |
 
-  Scenario: Null and default handling for all fields
-    Given a PSEK record with all nullable fields as null
-    When the SQL logic is executed
-    Then all fields in f_inv_movmnt are set to their default values as per the mapping
+  Scenario: Validation of cancel_dt logic
+    Given a PSEK record with PKLNR = "40001", ZEIPE = "01", PJAGR = "0001", patnr = "PQR678", perks = "006"
+    And the record exists in yesterday's data but not in today's data
+    When the ETL process runs
+    Then the cancel_dt field is set to the current date in yyyymmdd format
 
-  Scenario: Uniqueness constraint on txn_id
-    Given two PSEK records with the same pklnr, zeipe, and pjagr
-    When the SQL logic is executed
-    Then only one record with that txn_id is inserted into f_inv_movmnt
+  Scenario: Validation of unit_cost calculation
+    Given a PBEV record with xprsv = "S", xtprs = 100, peinl = 10
+    When the ETL process runs
+    Then the unit_cost field is set to 10.00
 
-  Scenario: Error handling for duplicate source records in joins
-    Given multiple PCHK records matching the same PSEK record
-    When the SQL logic is executed
-    Then only the first PCHK record ordered by irsda DESC is used for expired_dt
+    Given a PBEV record with xprsv = "V", perpr = 200, peinl = 5
+    When the ETL process runs
+    Then the unit_cost field is set to 40.00
 
-  Scenario: Error handling for data type mismatches
-    Given a source value for financial_qty that cannot be cast to double
-    When the SQL logic is executed
-    Then the record is rejected and an error is logged with message "Invalid data type for financial_qty"
+  Scenario: Validation of inv_stock_reference logic for LZBEP = B
+    Given a PSEK record with lzbep = "B" and lifdr = "SUPP123"
+    When the ETL process runs
+    Then inv_stock_reference is set to "SUPP123"
 
-  Scenario: Error handling for missing required item_nbr
-    Given a PSEK record with patnr as null
-    When the SQL logic is executed
-    Then the record is rejected and an error is logged with message "item_nbr (patnr) is required"
+    Given a PSEK record with lzbep = "B" and lifdr is blank
+    When the ETL process runs
+    Then inv_stock_reference is set to "None"
 
-  Scenario: Validation of output data
-    Given the f_inv_movmnt table is populated
-    When the data is validated
-    Then all records must:
-      | Field         | Validation Rule                                                                 |
-      | txn_id        | Not null, unique, format "<pklnr>|<zeipe>|<pjagr>"                              |
-      | inv_loc       | Not null, string, "none" if missing                                            |
-      | financial_qty | Not null, double, 0 if missing                                                 |
-      | net_qty       | Not null, double, 0 if missing                                                 |
-      | expired_dt    | Not null, yyyymmdd, "99991231" if missing                                      |
-      | item_nbr      | Not null, string                                                               |
-      | unit_cost     | double, rounded to 2 decimal places, null if missing                           |
-      | uom_rate      | Not null, double, always 0.76                                                  |
-      | plant_loc_cd  | Not null, string, "none" if missing                                            |
-      | inv_stock_reference | string, "none" if missing                                                |
-      | stock_type    | Not null, one of [RAW, WIP, FG, OT]                                            |
-      | qty_on_hand   | Not null, double, equals net_qty                                               |
-      | qty_shipped   | Not null, double, equals financial_qty - net_qty, 0 if negative                |
-      | cancel_dt     | yyyymmdd or null                                                               |
-      | flag_active   | Not null, "yes" or "no"                                                        |
-      | crt_dt        | Not null, timestamp                                                            |
-      | updt_dt       | Not null, timestamp                                                            |
+  Scenario: Validation of inv_stock_reference logic for LZBEP = L
+    Given a PSEK record with lzbep = "L" and dunnr = "DUNN123"
+    When the ETL process runs
+    Then inv_stock_reference is set to "DUNN123"
 
-  Scenario: Join precedence and order
-    Given all joins are defined as per the mapping
-    When the SQL logic is executed
-    Then joins are applied in the following order:
-      | Order | Join Description                                                                                 |
-      | 1     | left join pchk on pchk.TANPT = PSEK.TANPT AND pchk.PKLNR = PSEK.PKLNR                           |
-      | 2     | left join parl on psek.perks = parl.perks                                                       |
-      | 3     | left join PBEV on trim(psek.patnr) = trim(pbev.patnr) and psek.perks = pbev.dwkey               |
-      | 4     | left join L009T on parl.perks = l009t.perks and parl.tgort = l009t.tgort                        |
-      | 5     | left join para on pchk.tanpt = para.tanpt and pchk.patnr = para.patnr                           |
-      | 6     | left join VBAX to parl on vbax.tanpt = parl.tanpt AND vbax.patnr = parl.patnr AND vbax.perks = parl.perks |
+    Given a PSEK record with lzbep = "L", dunnr is blank, sdauf = "SO456", and a matching VBAX record with vpelm = "SO456" and dunnr = "DUNN456"
+    When the ETL process runs
+    Then inv_stock_reference is set to "DUNN456"
 
-  Scenario: Data volume and performance
-    Given the source tables contain more than 1 million records each
-    When the SQL logic is executed
-    Then the process completes within the defined SLA and does not cause timeouts or memory errors
+    Given a PSEK record with lzbep = "L", dunnr is blank, sdauf is blank
+    When the ETL process runs
+    Then inv_stock_reference is set to "None"
 
-  Scenario: Orchestration and triggering
-    Given the SQL logic is deployed in the data platform
-    When the scheduled job is triggered
-    Then the f_inv_movmnt table is refreshed as a full load
+  Scenario: Validation of inv_stock_reference logic for other LZBEP values
+    Given a PSEK record with lzbep = "X"
+    When the ETL process runs
+    Then inv_stock_reference is set to "None"
 
-  Scenario: Relationship with *_apl_qty tables
-    Given the f_inv_movmnt table is populated
-    When the *_apl_qty tables are populated
-    Then the txn_id values in *_apl_qty tables must reference existing txn_id values in f_inv_movmnt
+  Scenario: Validation of qty_on_hand and qty_shipped calculation
+    Given a record with net_qty = 15 and financial_qty = 20
+    When the ETL process runs
+    Then qty_on_hand is set to 15
+    And qty_shipped is set to 5
 
-  Scenario: Null/default propagation to *_apl_qty tables
-    Given a txn_id in f_inv_movmnt with default/null values for optional fields
-    When the corresponding *_apl_qty record is created
-    Then the *_apl_qty record is created with the same txn_id and appropriate default/null values for its fields
+  Scenario: Validation of default values for missing fields
+    Given a PSEK record with missing or null values for inv_loc, plant_loc_cd, stock_type, unit_cost, uom_rate, qty_shipped, flag_active
+    When the ETL process runs
+    Then the following default values are set:
+      | Field         | Default Value |
+      | inv_loc       | none          |
+      | plant_loc_cd  | none          |
+      | stock_type    | OT            |
+      | unit_cost     | 0.00          |
+      | uom_rate      | 0.76          |
+      | qty_shipped   | 0             |
+      | flag_active   | no            |
 
+  Scenario: Validation of timestamp fields
+    When the ETL process runs
+    Then crt_dt and updt_dt are set to the current timestamp
+
+  Scenario: Validation of PARA filter
+    Given a PARA record with prbha = "XPY-123"
+    When the ETL process runs
+    Then the record is included in the join
+
+    Given a PARA record with prbha = "ABC-123"
+    When the ETL process runs
+    Then the record is excluded from the join
+
+  Scenario: Validation of ETL frequency and orchestration
+    Given the ETL process is scheduled
+    When the process runs
+    Then it must support both full refresh and incremental load modes as per business requirements
+
+  Scenario: Handling of missing mapping and transformation logic for *_apl_qty* tables
+    Given the mapping and transformation logic for f_inv_movmnt_apl_qty, f_inv_movmnt_apl_qty_result, and f_inv_movmnt_apl_qty_test is not provided
+    When the ETL process runs
+    Then the process logs an error "Missing mapping and transformation logic for *_apl_qty* tables"
+    And no records are created in these tables until the logic is provided
+
+  Scenario: Validation of data volume and partitioning requirements
+    Given the expected data volume is not specified
+    When the ETL process runs
+    Then the process logs a warning "Data volume and partitioning requirements not specified"
+    And default partitioning is applied
+
+  Scenario: Validation of source table refresh cadence
+    Given the refresh cadence for source tables is not specified
+    When the ETL process runs
+    Then the process logs a warning "Source table refresh cadence not specified"
