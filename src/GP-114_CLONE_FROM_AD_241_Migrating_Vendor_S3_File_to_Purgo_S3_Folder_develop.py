@@ -1,220 +1,236 @@
 spark.catalog.setCurrentCatalog("purgo_databricks")
 
-# ==========================================================================================
-# Databricks PySpark Script: Transfer eligible files from Vendor S3 to Purgo S3
-# ==========================================================================================
+# ------------------------------------------------------------------------------------
+# Databricks PySpark Script: Transfer Active Files from Vendor S3 to Purgo S3
+# ------------------------------------------------------------------------------------
 # This script:
-#   - Reads S3 paths and file eligibility from purgo_databricks.purgo_playground.ingest_config_master
-#   - Uses AWS credentials from Databricks secret scope "aws_keys"
-#   - Lists files in Vendor, Purgo, and Archive S3 folders (non-recursive, root only)
-#   - Transfers only files that are:
-#       * In Vendor S3 folder
-#       * Not present in Purgo or Archive S3 folders
-#       * Marked as active (active_flag = 'A')
-#   - File name matching is case-sensitive and includes extension
-#   - Files are copied (not moved) from Vendor to Purgo S3
-#   - All outcomes (SUCCESS, SKIPPED, FAILED) are logged in purgo_databricks.purgo_playground.s3_file_process_log
-#   - Handles missing/invalid AWS credentials, missing S3 paths, and permission errors
-#   - Uses only Databricks native APIs and best practices
-#   - All code is Databricks-compatible and production-ready
-# ==========================================================================================
+#   - Reads all configs from purgo_playground.ingest_config_master where active_flag = 'A'
+#   - For each config, retrieves s3_vendor_path, s3_landing_path, s3_archive_path
+#   - Lists files at the root of the Vendor S3 path (no recursion)
+#   - Skips files already present (by base name, case-sensitive) in Purgo or Archive S3 folders
+#   - Copies eligible files from Vendor S3 to Purgo S3 (files remain in Vendor S3)
+#   - Logs all transfer attempts and errors to purgo_playground.s3_file_process_log
+#   - Handles missing configs, missing S3 paths, AWS credential errors, S3 access errors, and unexpected exceptions
+#   - Uses Databricks secrets for AWS credentials (scope: aws_keys, keys: access_key, secret_key)
+#   - All file operations use dbutils.fs (Databricks native)
+#   - All code is production-ready, robust, and follows Databricks best practices
+# ------------------------------------------------------------------------------------
 
-# =========================
+# ---------------------------------
 # Imports and Setup
-# =========================
-
-from pyspark.sql import SparkSession  # SparkSession is already available in Databricks
+# ---------------------------------
 from pyspark.sql import functions as F  
-from pyspark.sql.types import StringType, TimestampType  
+from pyspark.sql.types import StringType, TimestampType, StructType, StructField  
 from datetime import datetime  
-import sys  
+import traceback  
 
-# =========================
-# Section: Helper Functions
-# =========================
+# ---------------------------------
+# Helper Functions
+# ---------------------------------
 
-def get_aws_secret(scope, key):
+def get_aws_credentials():
     """
     Retrieve AWS credentials from Databricks secret scope.
-    Raises ValueError if missing or invalid.
+    Returns (access_key, secret_key) or (None, None) if missing/invalid.
     """
     try:
-        value = dbutils.secrets.get(scope=scope, key=key)
-        if not value:
-            raise ValueError(f"Missing or invalid AWS credentials: {key}")
-        return value
+        access_key = dbutils.secrets.get(scope="aws_keys", key="access_key")
+        secret_key = dbutils.secrets.get(scope="aws_keys", key="secret_key")
+        if not access_key or not secret_key:
+            return None, None
+        return access_key, secret_key
     except Exception:
-        raise ValueError(f"Missing or invalid AWS credentials: {key}")
+        return None, None
 
-def validate_s3_path(row, col_name):
+def s3_path_to_dbfs_mount(s3_path, access_key, secret_key):
     """
-    Validate that S3 path is not null or empty.
-    Raises ValueError if invalid.
+    Convert an S3 path to a dbfs mount path using s3a:// and AWS credentials.
+    This does NOT create a persistent mount, but allows dbutils.fs operations.
     """
-    val = row[col_name]
-    if val is None or str(val).strip() == "":
-        raise ValueError(f"Missing S3 path in ingest_config_master: {col_name}")
+    # s3_path: e.g., s3://bucket/folder
+    if not s3_path or not s3_path.startswith("s3://"):
+        return None
+    s3a_path = s3_path.replace("s3://", "s3a://", 1)
+    return s3a_path
 
-def list_s3_files(s3_path, aws_access_key, aws_secret_key):
+def list_s3_files_root(s3_path, access_key, secret_key):
     """
-    List files in the root of the given S3 path (non-recursive).
-    Returns a set of file names (not full paths).
-    Raises PermissionError if access is denied.
+    List all files at the root of the given S3 path (no recursion).
+    Returns a list of file base names (not full paths).
     """
+    s3a_path = s3_path_to_dbfs_mount(s3_path, access_key, secret_key)
+    if not s3a_path:
+        raise Exception(f"Invalid S3 path: {s3_path}")
     try:
-        # Remove trailing slash for consistency
-        s3_path = s3_path.rstrip("/")
-        # Use dbutils.fs.ls for S3 listing (Databricks native)
-        # Set AWS credentials for S3 access
-        spark._jsc.hadoopConfiguration().set("fs.s3a.access.key", aws_access_key)
-        spark._jsc.hadoopConfiguration().set("fs.s3a.secret.key", aws_secret_key)
-        # Only list root files (non-recursive)
-        files = dbutils.fs.ls(s3_path)
-        file_names = set()
-        for f in files:
-            # Only include files (not directories)
-            if not f.isDir():
-                # Only include files in the root (no '/')
-                name = f.name
-                if "/" not in name:
-                    file_names.add(name)
-        return file_names
+        # Set Hadoop configs for S3 access (session-scoped)
+        spark._jsc.hadoopConfiguration().set("fs.s3a.access.key", access_key)
+        spark._jsc.hadoopConfiguration().set("fs.s3a.secret.key", secret_key)
+        # List files at root (no recursion)
+        files = []
+        for f in dbutils.fs.ls(s3a_path):
+            if f.isFile():
+                # Only include files at the root (no subfolders)
+                base_name = f.name
+                if "/" not in base_name:
+                    files.append(base_name)
+        return files
     except Exception as e:
-        if "AccessDenied" in str(e) or "Permission denied" in str(e):
-            raise PermissionError(f"Permission denied for S3 path: {s3_path}")
-        # If path does not exist, treat as empty
-        if "NoSuchBucket" in str(e) or "does not exist" in str(e):
-            return set()
-        raise
+        raise Exception(f"S3 access denied or path not found: {s3_path} ({str(e)})")
 
-def copy_s3_file(src_path, dest_path, file_name, aws_access_key, aws_secret_key):
+def file_exists_in_s3(s3_path, file_name, access_key, secret_key):
     """
-    Copy a file from src_path/file_name to dest_path/file_name in S3.
-    Raises PermissionError if access is denied.
+    Check if a file with the given base name exists at the root of the S3 path.
+    Returns True if exists, False otherwise.
     """
     try:
-        # Remove trailing slash for consistency
-        src_path = src_path.rstrip("/")
-        dest_path = dest_path.rstrip("/")
-        src_file = f"{src_path}/{file_name}"
-        dest_file = f"{dest_path}/{file_name}"
-        # Set AWS credentials for S3 access
-        spark._jsc.hadoopConfiguration().set("fs.s3a.access.key", aws_access_key)
-        spark._jsc.hadoopConfiguration().set("fs.s3a.secret.key", aws_secret_key)
+        files = list_s3_files_root(s3_path, access_key, secret_key)
+        return file_name in files
+    except Exception:
+        return False
+
+def copy_s3_file(src_s3_path, dest_s3_path, file_name, access_key, secret_key):
+    """
+    Copy a file from src_s3_path/file_name to dest_s3_path/file_name using dbutils.fs.cp.
+    Returns True if successful, False otherwise.
+    """
+    src_s3a = s3_path_to_dbfs_mount(src_s3_path, access_key, secret_key)
+    dest_s3a = s3_path_to_dbfs_mount(dest_s3_path, access_key, secret_key)
+    if not src_s3a or not dest_s3a:
+        return False
+    src_file = src_s3a.rstrip("/") + "/" + file_name
+    dest_file = dest_s3a.rstrip("/") + "/" + file_name
+    try:
         dbutils.fs.cp(src_file, dest_file, recurse=False)
         return True
-    except Exception as e:
-        if "AccessDenied" in str(e) or "Permission denied" in str(e):
-            raise PermissionError(f"Permission denied for S3 path: {src_path if 'read' in str(e) else dest_path}")
-        raise
+    except Exception:
+        return False
 
-def log_file_process(file_name, s3_vendor_path, s3_landing_path, s3_archive_path, file_status):
+def log_file_process(file_name, s3_vendor_path, s3_landing_path, s3_archive_path, file_status, log_table, error_message=None):
     """
-    Log the file processing outcome to s3_file_process_log table.
+    Log a file processing attempt to the log table.
     """
-    # Ensure all values are strings or None
-    row = (
-        str(file_name) if file_name is not None else None,
-        str(s3_vendor_path) if s3_vendor_path is not None else None,
-        str(s3_landing_path) if s3_landing_path is not None else None,
-        str(s3_archive_path) if s3_archive_path is not None else None,
-        str(file_status),
-        datetime.now()
-    )
-    log_schema = ["file_name", "s3_vendor_path", "s3_landing_path", "s3_archive_path", "file_status", "file_processed_date"]
-    log_df = spark.createDataFrame([row], log_schema)
-    # Ensure schema matches target table
-    log_df = log_df.withColumn("file_processed_date", F.col("file_processed_date").cast(TimestampType()))
-    log_df.write.mode("append").format("delta").saveAsTable("purgo_databricks.purgo_playground.s3_file_process_log")
+    now = datetime.utcnow()
+    row = [(file_name, s3_vendor_path, s3_landing_path, s3_archive_path, file_status, now)]
+    schema = StructType([
+        StructField("file_name", StringType(), True),
+        StructField("s3_vendor_path", StringType(), True),
+        StructField("s3_landing_path", StringType(), True),
+        StructField("s3_archive_path", StringType(), True),
+        StructField("file_status", StringType(), True),
+        StructField("file_processed_date", TimestampType(), True)
+    ])
+    df = spark.createDataFrame(row, schema=schema)
+    # Ensure column count matches
+    if len(df.columns) == len(spark.table(log_table).columns):
+        df.write.mode("append").format("delta").saveAsTable(log_table)
+    # Optionally, print error for debugging
+    if error_message:
+        print(f"[{file_status}] {file_name}: {error_message}")
 
-# =========================
-# Section: Main Processing Logic
-# =========================
+# ---------------------------------
+# Main Processing Logic
+# ---------------------------------
 
-def main():
-    # Block: Retrieve AWS credentials from Databricks secret scope
-    try:
-        aws_access_key = get_aws_secret("aws_keys", "access_key")
-        aws_secret_key = get_aws_secret("aws_keys", "secret_key")
-    except ValueError as ve:
-        # Log and exit on missing/invalid credentials
-        print(str(ve))
-        sys.exit(1)
+def process_all_configs():
+    """
+    Main function to process all active configs and transfer eligible files.
+    """
+    config_table = "purgo_playground.ingest_config_master"
+    log_table = "purgo_playground.s3_file_process_log"
 
-    # Block: Read eligible configs from ingest_config_master (active_flag = 'A')
-    config_df = (
-        spark.table("purgo_databricks.purgo_playground.ingest_config_master")
-        .filter(F.col("active_flag") == "A")
-        .select(
-            "file_name",
-            "s3_vendor_path",
-            "s3_landing_path",
-            "s3_archive_path"
-        )
-    )
+    # Get AWS credentials
+    access_key, secret_key = get_aws_credentials()
+    if not access_key or not secret_key:
+        # Log error for all attempted configs
+        configs = spark.table(config_table).filter(F.col("active_flag") == "A").collect()
+        if not configs:
+            log_file_process(None, None, None, None, "ERROR", log_table, "AWS credentials missing or invalid")
+        else:
+            for cfg in configs:
+                log_file_process(None, cfg.s3_vendor_path, cfg.s3_landing_path, cfg.s3_archive_path, "ERROR", log_table, "AWS credentials missing or invalid")
+        return
 
-    # Block: Iterate over eligible configs
-    for row in config_df.collect():
-        file_name = row["file_name"]
-        s3_vendor_path = row["s3_vendor_path"]
-        s3_landing_path = row["s3_landing_path"]
-        s3_archive_path = row["s3_archive_path"]
+    # Read all active configs
+    configs = spark.table(config_table).filter(F.col("active_flag") == "A").collect()
+    if not configs:
+        # No active configs
+        log_file_process(None, None, None, None, "ERROR", log_table, "No active configs found")
+        return
 
-        # Validate S3 paths and file_name
+    for cfg in configs:
         try:
-            validate_s3_path(row, "s3_vendor_path")
-            validate_s3_path(row, "s3_landing_path")
-            validate_s3_path(row, "s3_archive_path")
-            if file_name is None or str(file_name).strip() == "":
-                raise ValueError("Missing or invalid file_name in ingest_config_master")
-        except ValueError as ve:
-            log_file_process(file_name, s3_vendor_path, s3_landing_path, s3_archive_path, "FAILED")
-            print(str(ve))
-            continue
+            s3_vendor_path = cfg.s3_vendor_path
+            s3_landing_path = cfg.s3_landing_path
+            s3_archive_path = cfg.s3_archive_path
+            config_id = cfg.config_id
 
-        # Block: List files in Vendor, Purgo, and Archive S3 folders (non-recursive)
-        try:
-            vendor_files = list_s3_files(s3_vendor_path, aws_access_key, aws_secret_key)
-            purgo_files = list_s3_files(s3_landing_path, aws_access_key, aws_secret_key)
-            archive_files = list_s3_files(s3_archive_path, aws_access_key, aws_secret_key)
-        except PermissionError as pe:
-            log_file_process(file_name, s3_vendor_path, s3_landing_path, s3_archive_path, "FAILED")
-            print(str(pe))
-            continue
+            # Validate S3 paths
+            if not s3_vendor_path or not s3_landing_path or not s3_archive_path:
+                log_file_process(None, s3_vendor_path, s3_landing_path, s3_archive_path, "ERROR", log_table, "Missing S3 path in config")
+                continue
+
+            # List files at root of Vendor S3 path
+            try:
+                vendor_files = list_s3_files_root(s3_vendor_path, access_key, secret_key)
+            except Exception as e:
+                log_file_process(None, s3_vendor_path, s3_landing_path, s3_archive_path, "ERROR", log_table, str(e))
+                continue
+
+            # List files at root of Purgo and Archive S3 paths
+            try:
+                purgo_files = list_s3_files_root(s3_landing_path, access_key, secret_key)
+            except Exception as e:
+                log_file_process(None, s3_vendor_path, s3_landing_path, s3_archive_path, "ERROR", log_table, str(e))
+                continue
+            try:
+                archive_files = list_s3_files_root(s3_archive_path, access_key, secret_key)
+            except Exception as e:
+                log_file_process(None, s3_vendor_path, s3_landing_path, s3_archive_path, "ERROR", log_table, str(e))
+                continue
+
+            # Determine eligible files (not in Purgo or Archive, by base name, case-sensitive)
+            eligible_files = []
+            skipped_exists = []
+            skipped_archive = []
+            for f in vendor_files:
+                if f in purgo_files:
+                    skipped_exists.append(f)
+                elif f in archive_files:
+                    skipped_archive.append(f)
+                else:
+                    eligible_files.append(f)
+
+            # Log skipped files (already in Purgo)
+            for f in skipped_exists:
+                log_file_process(f, s3_vendor_path, s3_landing_path, s3_archive_path, "SKIPPED_EXISTS", log_table, "File already exists in Purgo S3 folder")
+
+            # Log skipped files (already in Archive)
+            for f in skipped_archive:
+                log_file_process(f, s3_vendor_path, s3_landing_path, s3_archive_path, "SKIPPED_ARCHIVE", log_table, "File already exists in Archive S3 folder")
+
+            # If no eligible files, log SKIPPED_NONE
+            if not eligible_files:
+                log_file_process(None, s3_vendor_path, s3_landing_path, s3_archive_path, "SKIPPED_NONE", log_table, "No eligible files to transfer")
+                continue
+
+            # Copy eligible files and log results
+            for f in eligible_files:
+                try:
+                    success = copy_s3_file(s3_vendor_path, s3_landing_path, f, access_key, secret_key)
+                    if success:
+                        log_file_process(f, s3_vendor_path, s3_landing_path, s3_archive_path, "SUCCESS", log_table)
+                    else:
+                        log_file_process(f, s3_vendor_path, s3_landing_path, s3_archive_path, "ERROR", log_table, "File copy failed")
+                except Exception as e:
+                    log_file_process(f, s3_vendor_path, s3_landing_path, s3_archive_path, "ERROR", log_table, f"Unexpected error: {str(e)}")
         except Exception as e:
-            log_file_process(file_name, s3_vendor_path, s3_landing_path, s3_archive_path, "FAILED")
-            print(f"Unexpected error listing S3 files: {str(e)}")
-            continue
+            # Catch-all for unexpected config-level errors
+            log_file_process(None, getattr(cfg, "s3_vendor_path", None), getattr(cfg, "s3_landing_path", None), getattr(cfg, "s3_archive_path", None), "ERROR", log_table, f"Unexpected error: {traceback.format_exc()}")
 
-        # Block: Check eligibility for transfer
-        if file_name not in vendor_files:
-            # File not present in Vendor S3, skip
-            log_file_process(file_name, s3_vendor_path, s3_landing_path, s3_archive_path, "SKIPPED")
-            continue
-        if file_name in purgo_files or file_name in archive_files:
-            # File already present in Purgo or Archive, skip
-            log_file_process(file_name, s3_vendor_path, s3_landing_path, s3_archive_path, "SKIPPED")
-            continue
-
-        # Block: Copy file from Vendor to Purgo S3
-        try:
-            copy_s3_file(s3_vendor_path, s3_landing_path, file_name, aws_access_key, aws_secret_key)
-            log_file_process(file_name, s3_vendor_path, s3_landing_path, s3_archive_path, "SUCCESS")
-        except PermissionError as pe:
-            log_file_process(file_name, s3_vendor_path, s3_landing_path, s3_archive_path, "FAILED")
-            print(str(pe))
-            continue
-        except Exception as e:
-            log_file_process(file_name, s3_vendor_path, s3_landing_path, s3_archive_path, "FAILED")
-            print(f"File transfer failed: {str(e)}")
-            continue
-
-# =========================
-# Section: Script Entry Point
-# =========================
-
-if __name__ == "__main__":
-    main()
-# ==========================================================================================
-# End of script
-# ==========================================================================================
+# ---------------------------------
+# Execute Main Processing
+# ---------------------------------
+process_all_configs()
+# ------------------------------------------------------------------------------------
+# End of Script
+# ------------------------------------------------------------------------------------
