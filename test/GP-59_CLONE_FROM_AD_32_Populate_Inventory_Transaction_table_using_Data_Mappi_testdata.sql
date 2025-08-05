@@ -1,163 +1,238 @@
 -- Test Data Generation for purgo_playground.f_inv_movmnt
--- Covers: happy path, edge, error, null/default, special char, uniqueness, data type, and join scenarios
+-- Covers: happy path, edge, error, null, special/multibyte char, default, and mapping logic scenarios
 
 WITH test_data AS (
   SELECT
-    -- 1. Happy path: all fields populated, FERT->FG, LZBEP=B, lifdr present
-    '1001|01|200' AS txn_id,
+    -- 1. Happy path: All fields present, FERT stock type, LZBEP = B, lifdr present
+    '10001|01|0001' AS txn_id,
     'L001' AS inv_loc,
-    18.5 AS financial_qty,
-    18.5 AS net_qty,
-    '20240610' AS expired_dt,
+    20.0 AS financial_qty,
+    20.0 AS net_qty,
+    CAST(20240101 AS DECIMAL(38,0)) AS expired_qt,
     'ABC123' AS item_nbr,
-    50.00 AS unit_cost,
+    10.00 AS unit_cost,
     0.76 AS uom_rate,
-    'PL01' AS plant_loc_cd,
+    '001' AS plant_loc_cd,
     'SUPP001' AS inv_stock_reference,
     'FG' AS stock_type,
-    18.5 AS qty_on_hand,
+    20.0 AS qty_on_hand,
     0.0 AS qty_shipped,
     NULL AS cancel_dt,
-    'yes' AS flag_active,
-    current_timestamp() AS crt_dt,
-    current_timestamp() AS updt_dt
+    'no' AS flag_active,
+    TIMESTAMP('2024-03-21T00:00:00.000+0000') AS crt_dt,
+    TIMESTAMP('2024-03-21T00:00:00.000+0000') AS updt_dt
+
   UNION ALL
-    -- 2. Happy path: ROH->RAW, LZBEP=L, dunnr present
+
+    -- 2. Happy path: ROH stock type, LZBEP = L, dunnr present
     SELECT
-    '1002|02|201', 'L002', 12.4, 12.4, '20240611', 'XYZ789', 100.00, 0.76, 'PL02', 'DUN001', 'RAW', 12.4, 0.0, NULL, 'yes', current_timestamp(), current_timestamp()
+    '10002|02|0002', 'L002', 14.0, 28.0, CAST(20240102 AS DECIMAL(38,0)), 'DEF456', 30.00, 0.76, '002', 'DUNN002', 'RAW', 28.0, 0.0, NULL, 'no',
+    TIMESTAMP('2024-03-21T01:00:00.000+0000'), TIMESTAMP('2024-03-21T01:00:00.000+0000')
+
   UNION ALL
-    -- 3. Happy path: HALB->WIP, LZBEP=L, sdauf present, vbax.dunnr present
+
+    -- 3. Happy path: HALB stock type, LZBEP = L, dunnr blank, sdauf present, VBAX.dunnr used
     SELECT
-    '1003|03|202', 'L003', 15.0, 15.0, '20240612', 'DEF456', 75.50, 0.76, 'PL03', 'VBAXSUPP', 'WIP', 15.0, 0.0, NULL, 'yes', current_timestamp(), current_timestamp()
+    '10003|03|0003', 'L003', 0.0, 0.0, CAST(99991231 AS DECIMAL(38,0)), 'GHI789', 0.00, 0.76, '003', 'DUNN456', 'WIP', 0.0, 0.0, NULL, 'no',
+    TIMESTAMP('2024-03-21T02:00:00.000+0000'), TIMESTAMP('2024-03-21T02:00:00.000+0000')
+
   UNION ALL
-    -- 4. Happy path: ptart not mapped, should be OT
+
+    -- 4. Default values: missing source fields, all nulls/defaults
     SELECT
-    '1004|04|203', 'L004', 10.0, 10.0, '20240613', 'GHI789', 60.00, 0.76, 'PL04', 'none', 'OT', 10.0, 0.0, NULL, 'yes', current_timestamp(), current_timestamp()
+    '20001|01|0001', 'none', 0.0, 0.0, CAST(99991231 AS DECIMAL(38,0)), 'JKL012', 0.00, 0.76, 'none', 'None', 'OT', 0.0, 0.0, NULL, 'no',
+    CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP()
+
   UNION ALL
-    -- 5. Edge: LZBEP=B, lifdr null, should be 'none'
+
+    -- 5. Error case: duplicate txn_id (should be detected by validation, only one inserted)
     SELECT
-    '1005|05|204', 'L005', 8.0, 8.0, '20240614', 'JKL012', 55.00, 0.76, 'PL05', 'none', 'FG', 8.0, 0.0, NULL, 'yes', current_timestamp(), current_timestamp()
+    '30001|01|0001', 'L005', 12.0, 10.0, CAST(20240105 AS DECIMAL(38,0)), 'MNO345', 15.00, 0.76, '005', 'SUPP2', 'FG', 10.0, 2.0, NULL, 'yes',
+    TIMESTAMP('2024-03-21T03:00:00.000+0000'), TIMESTAMP('2024-03-21T03:00:00.000+0000')
+
   UNION ALL
-    -- 6. Edge: LZBEP=L, dunnr null, sdauf null, should be 'none'
+
+    -- 6. Edge: expired_qt is null (should default to 99991231)
     SELECT
-    '1006|06|205', 'L006', 7.0, 7.0, '20240615', 'MNO345', 45.00, 0.76, 'PL06', 'none', 'RAW', 7.0, 0.0, NULL, 'yes', current_timestamp(), current_timestamp()
+    '40001|01|0001', 'L006', 5.0, 5.0, CAST(99991231 AS DECIMAL(38,0)), 'PQR678', 5.00, 0.76, '006', 'None', 'OT', 5.0, 0.0, NULL, 'no',
+    TIMESTAMP('2024-03-21T04:00:00.000+0000'), TIMESTAMP('2024-03-21T04:00:00.000+0000')
+
   UNION ALL
-    -- 7. Edge: LZBEP=X, should be 'none'
+
+    -- 7. Edge: cancel_dt set (record missing in today's data)
     SELECT
-    '1007|07|206', 'L007', 6.0, 6.0, '20240616', 'PQR678', 40.00, 0.76, 'PL07', 'none', 'WIP', 6.0, 0.0, NULL, 'yes', current_timestamp(), current_timestamp()
+    '50001|01|0001', 'L007', 8.0, 8.0, CAST(20240107 AS DECIMAL(38,0)), 'STU901', 8.00, 0.76, '007', 'SUPP007', 'FG', 8.0, 0.0, CAST(20240320 AS DECIMAL(38,0)), 'no',
+    TIMESTAMP('2024-03-21T05:00:00.000+0000'), TIMESTAMP('2024-03-21T05:00:00.000+0000')
+
   UNION ALL
-    -- 8. Edge: dwart in RX, flag_active=no
+
+    -- 8. Special char: item_nbr with special and multibyte chars
     SELECT
-    '1008|08|207', 'L008', 5.0, 5.0, '20240617', 'STU901', 35.00, 0.76, 'PL08', 'SUPP002', 'FG', 5.0, 0.0, NULL, 'no', current_timestamp(), current_timestamp()
+    '60001|01|0001', 'L008', 9.0, 9.0, CAST(20240108 AS DECIMAL(38,0)), '特殊字符-ßΩ', 9.99, 0.76, '008', 'SUPP008', 'FG', 9.0, 0.0, NULL, 'yes',
+    TIMESTAMP('2024-03-21T06:00:00.000+0000'), TIMESTAMP('2024-03-21T06:00:00.000+0000')
+
   UNION ALL
-    -- 9. Edge: dwart in TX, flag_active=no
+
+    -- 9. Edge: unit_cost division by zero (peinl = 0), should default to 0.00
     SELECT
-    '1009|09|208', 'L009', 4.0, 4.0, '20240618', 'VWX234', 30.00, 0.76, 'PL09', 'SUPP003', 'RAW', 4.0, 0.0, NULL, 'no', current_timestamp(), current_timestamp()
+    '70001|01|0001', 'L009', 0.0, 0.0, CAST(20240109 AS DECIMAL(38,0)), 'DIV0', 0.00, 0.76, '009', 'None', 'OT', 0.0, 0.0, NULL, 'no',
+    TIMESTAMP('2024-03-21T07:00:00.000+0000'), TIMESTAMP('2024-03-21T07:00:00.000+0000')
+
   UNION ALL
-    -- 10. Edge: dwart in PX, flag_active=no
+
+    -- 10. Edge: LZBEP = L, dunnr and sdauf blank, inv_stock_reference = None
     SELECT
-    '1010|10|209', 'L010', 3.0, 3.0, '20240619', 'YZA567', 25.00, 0.76, 'PL10', 'SUPP004', 'WIP', 3.0, 0.0, NULL, 'no', current_timestamp(), current_timestamp()
+    '80001|01|0001', 'L010', 11.0, 11.0, CAST(20240110 AS DECIMAL(38,0)), 'NOP123', 11.00, 0.76, '010', 'None', 'RAW', 11.0, 0.0, NULL, 'no',
+    TIMESTAMP('2024-03-21T08:00:00.000+0000'), TIMESTAMP('2024-03-21T08:00:00.000+0000')
+
   UNION ALL
-    -- 11. Edge: dwart null, flag_active=no
+
+    -- 11. Edge: LZBEP = X, inv_stock_reference = None
     SELECT
-    '1011|11|210', 'L011', 2.0, 2.0, '20240620', 'BCD890', 20.00, 0.76, 'PL11', 'SUPP005', 'OT', 2.0, 0.0, NULL, 'no', current_timestamp(), current_timestamp()
+    '90001|01|0001', 'L011', 13.0, 13.0, CAST(20240111 AS DECIMAL(38,0)), 'XYZ789', 13.00, 0.76, '011', 'None', 'OT', 13.0, 0.0, NULL, 'no',
+    TIMESTAMP('2024-03-21T09:00:00.000+0000'), TIMESTAMP('2024-03-21T09:00:00.000+0000')
+
   UNION ALL
-    -- 12. Error: item_nbr null (should be rejected, but included for error test)
+
+    -- 12. Edge: stock_type = OT (unknown ptart)
     SELECT
-    '1012|12|211', 'L012', 1.0, 1.0, '20240621', NULL, 15.00, 0.76, 'PL12', 'SUPP006', 'FG', 1.0, 0.0, NULL, 'yes', current_timestamp(), current_timestamp()
+    '10011|01|0001', 'L012', 7.0, 7.0, CAST(20240112 AS DECIMAL(38,0)), 'UNK001', 7.00, 0.76, '012', 'SUPP012', 'OT', 7.0, 0.0, NULL, 'no',
+    TIMESTAMP('2024-03-21T10:00:00.000+0000'), TIMESTAMP('2024-03-21T10:00:00.000+0000')
+
   UNION ALL
-    -- 13. Error: financial_qty as string (should be rejected, but included for error test)
+
+    -- 13. Edge: flag_active = yes (dwart = AB)
     SELECT
-    '1013|13|212', 'L013', CAST('not_a_number' AS DOUBLE), 1.0, '20240622', 'EFG123', 10.00, 0.76, 'PL13', 'SUPP007', 'RAW', 1.0, 0.0, NULL, 'yes', current_timestamp(), current_timestamp()
+    '10012|01|0001', 'L013', 6.0, 6.0, CAST(20240113 AS DECIMAL(38,0)), 'YES001', 6.00, 0.76, '013', 'SUPP013', 'FG', 6.0, 0.0, NULL, 'yes',
+    TIMESTAMP('2024-03-21T11:00:00.000+0000'), TIMESTAMP('2024-03-21T11:00:00.000+0000')
+
   UNION ALL
-    -- 14. Error: net_qty as string (should be rejected, but included for error test)
+
+    -- 14. Edge: flag_active = no (dwart = RX)
     SELECT
-    '1014|14|213', 'L014', 1.0, CAST('not_a_number' AS DOUBLE), '20240623', 'HIJ456', 5.00, 0.76, 'PL14', 'SUPP008', 'WIP', 1.0, 0.0, NULL, 'yes', current_timestamp(), current_timestamp()
+    '10013|01|0001', 'L014', 5.0, 5.0, CAST(20240114 AS DECIMAL(38,0)), 'NO001', 5.00, 0.76, '014', 'SUPP014', 'FG', 5.0, 0.0, NULL, 'no',
+    TIMESTAMP('2024-03-21T12:00:00.000+0000'), TIMESTAMP('2024-03-21T12:00:00.000+0000')
+
   UNION ALL
-    -- 15. Null handling: inv_loc null, should be 'none'
+
+    -- 15. Edge: qty_on_hand < financial_qty, qty_shipped = financial_qty - qty_on_hand
     SELECT
-    '1015|15|214', NULL, 2.0, 2.0, '20240624', 'KLM789', 12.00, 0.76, 'PL15', 'SUPP009', 'FG', 2.0, 0.0, NULL, 'yes', current_timestamp(), current_timestamp()
+    '10014|01|0001', 'L015', 20.0, 15.0, CAST(20240115 AS DECIMAL(38,0)), 'SHIP001', 12.00, 0.76, '015', 'SUPP015', 'FG', 15.0, 5.0, NULL, 'yes',
+    TIMESTAMP('2024-03-21T13:00:00.000+0000'), TIMESTAMP('2024-03-21T13:00:00.000+0000')
+
   UNION ALL
-    -- 16. Null handling: plant_loc_cd null, should be 'none'
+
+    -- 16. Edge: qty_on_hand = 0, qty_shipped = financial_qty
     SELECT
-    '1016|16|215', 'L016', 3.0, 3.0, '20240625', 'NOP012', 13.00, 0.76, NULL, 'SUPP010', 'RAW', 3.0, 0.0, NULL, 'yes', current_timestamp(), current_timestamp()
+    '10015|01|0001', 'L016', 10.0, 0.0, CAST(20240116 AS DECIMAL(38,0)), 'SHIP002', 8.00, 0.76, '016', 'SUPP016', 'FG', 0.0, 10.0, NULL, 'no',
+    TIMESTAMP('2024-03-21T14:00:00.000+0000'), TIMESTAMP('2024-03-21T14:00:00.000+0000')
+
   UNION ALL
-    -- 17. Null handling: financial_qty null, should be 0
+
+    -- 17. Edge: qty_on_hand = financial_qty, qty_shipped = 0
     SELECT
-    '1017|17|216', 'L017', NULL, 4.0, '20240626', 'QRS345', 14.00, 0.76, 'PL17', 'SUPP011', 'WIP', 4.0, 0.0, NULL, 'yes', current_timestamp(), current_timestamp()
+    '10016|01|0001', 'L017', 5.0, 5.0, CAST(20240117 AS DECIMAL(38,0)), 'SHIP003', 6.00, 0.76, '017', 'SUPP017', 'FG', 5.0, 0.0, NULL, 'yes',
+    TIMESTAMP('2024-03-21T15:00:00.000+0000'), TIMESTAMP('2024-03-21T15:00:00.000+0000')
+
   UNION ALL
-    -- 18. Null handling: net_qty null, should be 0
+
+    -- 18. Edge: NULL handling for all nullable fields
     SELECT
-    '1018|18|217', 'L018', 5.0, NULL, '20240627', 'TUV678', 15.00, 0.76, 'PL18', 'SUPP012', 'OT', 0.0, 0.0, NULL, 'yes', current_timestamp(), current_timestamp()
+    '10017|01|0001', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+    CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP()
+
   UNION ALL
-    -- 19. Null handling: expired_dt null, should be '99991231'
+
+    -- 19. Special char: inv_loc and plant_loc_cd with special/multibyte chars
     SELECT
-    '1019|19|218', 'L019', 6.0, 6.0, NULL, 'WXY901', 16.00, 0.76, 'PL19', 'SUPP013', 'FG', 6.0, 0.0, NULL, 'yes', current_timestamp(), current_timestamp()
+    '10018|01|0001', '特殊L018', 18.0, 18.0, CAST(20240118 AS DECIMAL(38,0)), 'SPC001', 18.00, 0.76, '特殊P018', 'SUPP018', 'FG', 18.0, 0.0, NULL, 'yes',
+    TIMESTAMP('2024-03-21T16:00:00.000+0000'), TIMESTAMP('2024-03-21T16:00:00.000+0000')
+
   UNION ALL
-    -- 20. Null handling: unit_cost null
+
+    -- 20. Edge: expired_qt with max value
     SELECT
-    '1020|20|219', 'L020', 7.0, 7.0, '20240629', 'ZAB234', NULL, 0.76, 'PL20', 'SUPP014', 'RAW', 7.0, 0.0, NULL, 'yes', current_timestamp(), current_timestamp()
+    '10019|01|0001', 'L019', 19.0, 19.0, CAST(99991231 AS DECIMAL(38,0)), 'MAX001', 19.00, 0.76, '019', 'SUPP019', 'FG', 19.0, 0.0, NULL, 'yes',
+    TIMESTAMP('2024-03-21T17:00:00.000+0000'), TIMESTAMP('2024-03-21T17:00:00.000+0000')
+
   UNION ALL
-    -- 21. Null handling: cancel_dt present (simulate cancel)
+
+    -- 21. Edge: expired_qt with min value
     SELECT
-    '1021|21|220', 'L021', 8.0, 8.0, '20240630', 'CDE567', 18.00, 0.76, 'PL21', 'SUPP015', 'WIP', 8.0, 0.0, 20240630, 'yes', current_timestamp(), current_timestamp()
+    '10020|01|0001', 'L020', 20.0, 20.0, CAST(19000101 AS DECIMAL(38,0)), 'MIN001', 20.00, 0.76, '020', 'SUPP020', 'FG', 20.0, 0.0, NULL, 'yes',
+    TIMESTAMP('2024-03-21T18:00:00.000+0000'), TIMESTAMP('2024-03-21T18:00:00.000+0000')
+
   UNION ALL
-    -- 22. Special char: item_nbr with special chars
+
+    -- 22. Edge: inv_loc, plant_loc_cd, inv_stock_reference, stock_type all null
     SELECT
-    '1022|22|221', 'L022', 9.0, 9.0, '20240701', 'A!@#$', 19.00, 0.76, 'PL22', 'SUPP016', 'FG', 9.0, 0.0, NULL, 'yes', current_timestamp(), current_timestamp()
+    '10021|01|0001', NULL, 21.0, 21.0, CAST(20240121 AS DECIMAL(38,0)), 'NULLS001', 21.00, 0.76, NULL, NULL, NULL, 21.0, 0.0, NULL, 'no',
+    TIMESTAMP('2024-03-21T19:00:00.000+0000'), TIMESTAMP('2024-03-21T19:00:00.000+0000')
+
   UNION ALL
-    -- 23. Special char: inv_loc with multi-byte chars
+
+    -- 23. Edge: qty_on_hand, qty_shipped null
     SELECT
-    '1023|23|222', '多字节', 10.0, 10.0, '20240702', 'FGH890', 20.00, 0.76, 'PL23', 'SUPP017', 'RAW', 10.0, 0.0, NULL, 'yes', current_timestamp(), current_timestamp()
+    '10022|01|0001', 'L022', 22.0, NULL, CAST(20240122 AS DECIMAL(38,0)), 'QNULL001', 22.00, 0.76, '022', 'SUPP022', 'FG', NULL, NULL, NULL, 'yes',
+    TIMESTAMP('2024-03-21T20:00:00.000+0000'), TIMESTAMP('2024-03-21T20:00:00.000+0000')
+
   UNION ALL
-    -- 24. Special char: plant_loc_cd with emoji
+
+    -- 24. Edge: flag_active = no (dwart = null)
     SELECT
-    '1024|24|223', 'L024', 11.0, 11.0, '20240703', 'IJK123', 21.00, 0.76, 'PL24😀', 'SUPP018', 'WIP', 11.0, 0.0, NULL, 'yes', current_timestamp(), current_timestamp()
+    '10023|01|0001', 'L023', 23.0, 23.0, CAST(20240123 AS DECIMAL(38,0)), 'NOFLAG001', 23.00, 0.76, '023', 'SUPP023', 'FG', 23.0, 0.0, NULL, 'no',
+    TIMESTAMP('2024-03-21T21:00:00.000+0000'), TIMESTAMP('2024-03-21T21:00:00.000+0000')
+
   UNION ALL
-    -- 25. Special char: inv_stock_reference with special chars
+
+    -- 25. Edge: unit_cost with 2 decimal rounding
     SELECT
-    '1025|25|224', 'L025', 12.0, 12.0, '20240704', 'LMN456', 22.00, 0.76, 'PL25', 'SUPP019@#$', 'OT', 12.0, 0.0, NULL, 'yes', current_timestamp(), current_timestamp()
+    '10024|01|0001', 'L024', 24.0, 24.0, CAST(20240124 AS DECIMAL(38,0)), 'ROUND001', 33.3333, 0.76, '024', 'SUPP024', 'FG', 24.0, 0.0, NULL, 'yes',
+    TIMESTAMP('2024-03-21T22:00:00.000+0000'), TIMESTAMP('2024-03-21T22:00:00.000+0000')
+
   UNION ALL
-    -- 26. Edge: qty_shipped = financial_qty - net_qty, positive
+
+    -- 26. Edge: inv_stock_reference = None (LZBEP not B or L)
     SELECT
-    '1026|26|225', 'L026', 20.0, 15.0, '20240705', 'OPQ789', 23.00, 0.76, 'PL26', 'SUPP020', 'FG', 15.0, 5.0, NULL, 'yes', current_timestamp(), current_timestamp()
+    '10025|01|0001', 'L025', 25.0, 25.0, CAST(20240125 AS DECIMAL(38,0)), 'NONE001', 25.00, 0.76, '025', 'None', 'FG', 25.0, 0.0, NULL, 'yes',
+    TIMESTAMP('2024-03-21T23:00:00.000+0000'), TIMESTAMP('2024-03-21T23:00:00.000+0000')
+
   UNION ALL
-    -- 27. Edge: qty_shipped negative, should be 0
+
+    -- 27. Special char: flag_active with special char (should be 'yes' or 'no', but test for error)
     SELECT
-    '1027|27|226', 'L027', 10.0, 15.0, '20240706', 'RST012', 24.00, 0.76, 'PL27', 'SUPP021', 'RAW', 15.0, 0.0, NULL, 'yes', current_timestamp(), current_timestamp()
+    '10026|01|0001', 'L026', 26.0, 26.0, CAST(20240126 AS DECIMAL(38,0)), 'FLAGSPC', 26.00, 0.76, '026', 'SUPP026', 'FG', 26.0, 0.0, NULL, 'yës',
+    TIMESTAMP('2024-03-21T23:30:00.000+0000'), TIMESTAMP('2024-03-21T23:30:00.000+0000')
+
   UNION ALL
-    -- 28. Uniqueness: duplicate txn_id, only one should be inserted (simulate by including two, but only one will be loaded in real test)
+
+    -- 28. Edge: All string fields with max length and special chars
     SELECT
-    '1028|28|227', 'L028', 13.0, 13.0, '20240707', 'UVW345', 25.00, 0.76, 'PL28', 'SUPP022', 'WIP', 13.0, 0.0, NULL, 'yes', current_timestamp(), current_timestamp()
+    RPAD('99999', 50, 'X') || '|' || RPAD('99', 10, 'Y') || '|' || RPAD('9999', 10, 'Z'),
+    RPAD('L999', 30, 'Ω'),
+    99.99, 99.99, CAST(20241231 AS DECIMAL(38,0)),
+    RPAD('ITEM999', 40, 'ß'),
+    99.99, 0.76,
+    RPAD('PLANT999', 30, '€'),
+    RPAD('SUPP999', 30, '¥'),
+    'FG',
+    99.99, 0.0, NULL, 'yes',
+    TIMESTAMP('2024-03-21T23:59:59.000+0000'), TIMESTAMP('2024-03-21T23:59:59.000+0000')
+
   UNION ALL
-    -- 29. Uniqueness: duplicate txn_id (should be rejected in real test)
+
+    -- 29. Edge: All numeric fields at min value
     SELECT
-    '1028|28|227', 'L028', 14.0, 14.0, '20240708', 'XYZ678', 26.00, 0.76, 'PL28', 'SUPP023', 'OT', 14.0, 0.0, NULL, 'yes', current_timestamp(), current_timestamp()
+    '10027|01|0001', 'L027', 0.0, 0.0, CAST(19000101 AS DECIMAL(38,0)), 'MINNUM', 0.00, 0.76, '027', 'SUPP027', 'FG', 0.0, 0.0, NULL, 'no',
+    TIMESTAMP('2024-03-21T00:00:01.000+0000'), TIMESTAMP('2024-03-21T00:00:01.000+0000')
+
   UNION ALL
-    -- 30. All null/defaults (except txn_id, crt_dt, updt_dt)
+
+    -- 30. Edge: All numeric fields at max value
     SELECT
-    '1029|29|228', NULL, NULL, NULL, NULL, NULL, NULL, 0.76, NULL, NULL, NULL, NULL, NULL, NULL, NULL, current_timestamp(), current_timestamp()
+    '10028|01|0001', 'L028', 9999999999.99, 9999999999.99, CAST(99991231 AS DECIMAL(38,0)), 'MAXNUM', 9999999999.99, 0.76, '028', 'SUPP028', 'FG', 9999999999.99, 0.0, NULL, 'yes',
+    TIMESTAMP('2024-03-21T00:00:02.000+0000'), TIMESTAMP('2024-03-21T00:00:02.000+0000')
 )
-SELECT
-  txn_id,
-  COALESCE(inv_loc, 'none') AS inv_loc,
-  COALESCE(financial_qty, 0.0) AS financial_qty,
-  COALESCE(net_qty, 0.0) AS net_qty,
-  COALESCE(expired_dt, '99991231') AS expired_dt,
-  item_nbr,
-  unit_cost,
-  uom_rate,
-  COALESCE(plant_loc_cd, 'none') AS plant_loc_cd,
-  COALESCE(inv_stock_reference, 'none') AS inv_stock_reference,
-  COALESCE(stock_type, 'OT') AS stock_type,
-  COALESCE(qty_on_hand, COALESCE(net_qty, 0.0)) AS qty_on_hand,
-  CASE
-    WHEN COALESCE(financial_qty, 0.0) - COALESCE(net_qty, 0.0) < 0 THEN 0.0
-    ELSE COALESCE(financial_qty, 0.0) - COALESCE(net_qty, 0.0)
-  END AS qty_shipped,
-  cancel_dt,
-  COALESCE(flag_active, 'no') AS flag_active,
-  crt_dt,
-  updt_dt
-FROM test_data
+
+SELECT * FROM test_data
 ;
