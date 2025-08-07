@@ -1,15 +1,16 @@
 spark.catalog.setCurrentCatalog("purgo_databricks")
 
-# Test Data Generation for purgo_playground.ingest_config_master, s3_file_process_log, and S3 folder/file simulation
+# Test Data Generation for purgo_playground.ingest_config_master
+# PySpark code for Databricks
 
 # from pyspark.sql import SparkSession  # SparkSession is already available in Databricks
-from pyspark.sql.types import (StructType, StructField, StringType, TimestampType)  
+from pyspark.sql.types import (  
+    StructType, StructField, StringType, IntegerType, LongType, TimestampType
+)
 from pyspark.sql import Row  
-from pyspark.sql.functions import lit, current_timestamp  
+from datetime import datetime  
 
-# -------------------------------
-# 1. Test Data for ingest_config_master
-# -------------------------------
+# Test data covers: happy path, edge, error, null, special/multibyte chars
 
 ingest_config_master_schema = StructType([
     StructField("config_id", StringType(), True),
@@ -47,278 +48,194 @@ ingest_config_master_schema = StructType([
 ])
 
 ingest_config_master_data = [
-    # Happy path
-    Row(config_id="123", source_object_name="objA", source_system="sysA", file_name="data1.csv", frequency="DAILY", location="locA", domain="domA", sub_domain="subA",
-        s3_vendor_path="s3://vendor-bucket/folderA/", source_path=None, s3_landing_path="s3://purgo-bucket/landingA/", s3_archive_path="s3://purgo-bucket/archiveA/",
-        delta_load_ts="2024-03-21T00:00:00.000+0000", full_or_incremental_load="FULL", zip_file="N", vendor="VendorA", delimiter=",", source_landing=None,
-        src_landing_table_name=None, publish_unstitched=None, publish_unstitched_table_name=None, publish_stitched=None, publish_stitched_table_name=None,
-        primary_key=None, header="Y", date_pattern=None, actual_file_name=None, vendor_file_deletion_flag=None, file_recursive_flag="N", total_weeks_req_data=None,
-        total_weeks_file_data=None, active_flag="A"),
-    # Inactive config
-    Row(config_id="124", source_object_name="objB", source_system="sysB", file_name="data3.csv", frequency="WEEKLY", location="locB", domain="domB", sub_domain="subB",
-        s3_vendor_path="s3://vendor-bucket/folderB/", source_path=None, s3_landing_path="s3://purgo-bucket/landingB/", s3_archive_path="s3://purgo-bucket/archiveB/",
-        delta_load_ts="2024-03-22T00:00:00.000+0000", full_or_incremental_load="INCR", zip_file="N", vendor="VendorB", delimiter="|", source_landing=None,
-        src_landing_table_name=None, publish_unstitched=None, publish_unstitched_table_name=None, publish_stitched=None, publish_stitched_table_name=None,
-        primary_key=None, header="N", date_pattern=None, actual_file_name=None, vendor_file_deletion_flag=None, file_recursive_flag="N", total_weeks_req_data=None,
-        total_weeks_file_data=None, active_flag="I"),
-    # File in archive
-    Row(config_id="125", source_object_name="objC", source_system="sysC", file_name="data4.csv", frequency="MONTHLY", location="locC", domain="domC", sub_domain="subC",
-        s3_vendor_path="s3://vendor-bucket/folderC/", source_path=None, s3_landing_path="s3://purgo-bucket/landingC/", s3_archive_path="s3://purgo-bucket/archiveC/",
-        delta_load_ts="2024-03-23T00:00:00.000+0000", full_or_incremental_load="FULL", zip_file="Y", vendor="VendorC", delimiter=";", source_landing=None,
-        src_landing_table_name=None, publish_unstitched=None, publish_unstitched_table_name=None, publish_stitched=None, publish_stitched_table_name=None,
-        primary_key=None, header="Y", date_pattern=None, actual_file_name=None, vendor_file_deletion_flag=None, file_recursive_flag="N", total_weeks_req_data=None,
-        total_weeks_file_data=None, active_flag="A"),
-    # Missing S3 path (error case)
-    Row(config_id="126", source_object_name="objD", source_system="sysD", file_name="data5.csv", frequency="DAILY", location="locD", domain="domD", sub_domain="subD",
-        s3_vendor_path=None, source_path=None, s3_landing_path="s3://purgo-bucket/landingD/", s3_archive_path="s3://purgo-bucket/archiveD/",
-        delta_load_ts="2024-03-24T00:00:00.000+0000", full_or_incremental_load="FULL", zip_file="N", vendor="VendorD", delimiter=",", source_landing=None,
-        src_landing_table_name=None, publish_unstitched=None, publish_unstitched_table_name=None, publish_stitched=None, publish_stitched_table_name=None,
-        primary_key=None, header="Y", date_pattern=None, actual_file_name=None, vendor_file_deletion_flag=None, file_recursive_flag="N", total_weeks_req_data=None,
-        total_weeks_file_data=None, active_flag="A"),
-    # Case-sensitive file name
-    Row(config_id="127", source_object_name="objE", source_system="sysE", file_name="Data6.CSV", frequency="DAILY", location="locE", domain="domE", sub_domain="subE",
-        s3_vendor_path="s3://vendor-bucket/folderE/", source_path=None, s3_landing_path="s3://purgo-bucket/landingE/", s3_archive_path="s3://purgo-bucket/archiveE/",
-        delta_load_ts="2024-03-25T00:00:00.000+0000", full_or_incremental_load="FULL", zip_file="N", vendor="VendorE", delimiter=",", source_landing=None,
-        src_landing_table_name=None, publish_unstitched=None, publish_unstitched_table_name=None, publish_stitched=None, publish_stitched_table_name=None,
-        primary_key=None, header="Y", date_pattern=None, actual_file_name=None, vendor_file_deletion_flag=None, file_recursive_flag="N", total_weeks_req_data=None,
-        total_weeks_file_data=None, active_flag="A"),
-    # Data-driven test cases (201-205)
-    Row(config_id="201", source_object_name="objF", source_system="sysF", file_name="fileA.csv", frequency="DAILY", location="locF", domain="domF", sub_domain="subF",
-        s3_vendor_path="s3://vendor-bucket/folderF/", source_path=None, s3_landing_path="s3://purgo-bucket/landingF/", s3_archive_path="s3://purgo-bucket/archiveF/",
-        delta_load_ts="2024-03-26T00:00:00.000+0000", full_or_incremental_load="FULL", zip_file="N", vendor="VendorF", delimiter=",", source_landing=None,
-        src_landing_table_name=None, publish_unstitched=None, publish_unstitched_table_name=None, publish_stitched=None, publish_stitched_table_name=None,
-        primary_key=None, header="Y", date_pattern=None, actual_file_name=None, vendor_file_deletion_flag=None, file_recursive_flag="N", total_weeks_req_data=None,
-        total_weeks_file_data=None, active_flag="A"),
-    Row(config_id="202", source_object_name="objG", source_system="sysG", file_name="fileB.csv", frequency="DAILY", location="locG", domain="domG", sub_domain="subG",
-        s3_vendor_path="s3://vendor-bucket/folderG/", source_path=None, s3_landing_path="s3://purgo-bucket/landingG/", s3_archive_path="s3://purgo-bucket/archiveG/",
-        delta_load_ts="2024-03-27T00:00:00.000+0000", full_or_incremental_load="FULL", zip_file="N", vendor="VendorG", delimiter=",", source_landing=None,
-        src_landing_table_name=None, publish_unstitched=None, publish_unstitched_table_name=None, publish_stitched=None, publish_stitched_table_name=None,
-        primary_key=None, header="Y", date_pattern=None, actual_file_name=None, vendor_file_deletion_flag=None, file_recursive_flag="N", total_weeks_req_data=None,
-        total_weeks_file_data=None, active_flag="A"),
-    Row(config_id="203", source_object_name="objH", source_system="sysH", file_name="fileC.csv", frequency="DAILY", location="locH", domain="domH", sub_domain="subH",
-        s3_vendor_path="s3://vendor-bucket/folderH/", source_path=None, s3_landing_path="s3://purgo-bucket/landingH/", s3_archive_path="s3://purgo-bucket/archiveH/",
-        delta_load_ts="2024-03-28T00:00:00.000+0000", full_or_incremental_load="FULL", zip_file="N", vendor="VendorH", delimiter=",", source_landing=None,
-        src_landing_table_name=None, publish_unstitched=None, publish_unstitched_table_name=None, publish_stitched=None, publish_stitched_table_name=None,
-        primary_key=None, header="Y", date_pattern=None, actual_file_name=None, vendor_file_deletion_flag=None, file_recursive_flag="N", total_weeks_req_data=None,
-        total_weeks_file_data=None, active_flag="A"),
-    Row(config_id="204", source_object_name="objI", source_system="sysI", file_name="fileD.csv", frequency="DAILY", location="locI", domain="domI", sub_domain="subI",
-        s3_vendor_path="s3://vendor-bucket/folderI/", source_path=None, s3_landing_path="s3://purgo-bucket/landingI/", s3_archive_path="s3://purgo-bucket/archiveI/",
-        delta_load_ts="2024-03-29T00:00:00.000+0000", full_or_incremental_load="FULL", zip_file="N", vendor="VendorI", delimiter=",", source_landing=None,
-        src_landing_table_name=None, publish_unstitched=None, publish_unstitched_table_name=None, publish_stitched=None, publish_stitched_table_name=None,
-        primary_key=None, header="Y", date_pattern=None, actual_file_name=None, vendor_file_deletion_flag=None, file_recursive_flag="N", total_weeks_req_data=None,
-        total_weeks_file_data=None, active_flag="I"),
-    Row(config_id="205", source_object_name="objJ", source_system="sysJ", file_name="fileE.csv", frequency="DAILY", location="locJ", domain="domJ", sub_domain="subJ",
-        s3_vendor_path="s3://vendor-bucket/folderJ/", source_path=None, s3_landing_path="s3://purgo-bucket/landingJ/", s3_archive_path="s3://purgo-bucket/archiveJ/",
-        delta_load_ts="2024-03-30T00:00:00.000+0000", full_or_incremental_load="FULL", zip_file="N", vendor="VendorJ", delimiter=",", source_landing=None,
-        src_landing_table_name=None, publish_unstitched=None, publish_unstitched_table_name=None, publish_stitched=None, publish_stitched_table_name=None,
-        primary_key=None, header="Y", date_pattern=None, actual_file_name=None, vendor_file_deletion_flag=None, file_recursive_flag="N", total_weeks_req_data=None,
-        total_weeks_file_data=None, active_flag="A"),
-    # Special characters, multi-byte, NULLs, edge cases
-    Row(config_id="301", source_object_name="objK", source_system="sysK", file_name="fileG.csv", frequency="DAILY", location="locK", domain="domK", sub_domain="subK",
-        s3_vendor_path="s3://vendor-bucket/folderK/", source_path=None, s3_landing_path="s3://purgo-bucket/landingK/", s3_archive_path="s3://purgo-bucket/archiveK/",
-        delta_load_ts="2024-03-31T00:00:00.000+0000", full_or_incremental_load="FULL", zip_file="N", vendor="VendorK", delimiter=",", source_landing=None,
-        src_landing_table_name=None, publish_unstitched=None, publish_unstitched_table_name=None, publish_stitched=None, publish_stitched_table_name=None,
-        primary_key=None, header="Y", date_pattern=None, actual_file_name=None, vendor_file_deletion_flag=None, file_recursive_flag="N", total_weeks_req_data=None,
-        total_weeks_file_data=None, active_flag="A"),
-    Row(config_id="401", source_object_name="objL", source_system="sysL", file_name="fileI.csv", frequency="DAILY", location="locL", domain="domL", sub_domain="subL",
-        s3_vendor_path="s3://vendor-bucket/folderL/", source_path=None, s3_landing_path="s3://purgo-bucket/landingL/", s3_archive_path="s3://purgo-bucket/archiveL/",
-        delta_load_ts="2024-04-01T00:00:00.000+0000", full_or_incremental_load="FULL", zip_file="N", vendor="VendorL", delimiter=",", source_landing=None,
-        src_landing_table_name=None, publish_unstitched=None, publish_unstitched_table_name=None, publish_stitched=None, publish_stitched_table_name=None,
-        primary_key=None, header="Y", date_pattern=None, actual_file_name=None, vendor_file_deletion_flag=None, file_recursive_flag="N", total_weeks_req_data=None,
-        total_weeks_file_data=None, active_flag="A"),
-    Row(config_id="501", source_object_name="objM", source_system="sysM", file_name="fileJ.csv", frequency="DAILY", location="locM", domain="domM", sub_domain="subM",
-        s3_vendor_path="s3://vendor-bucket/folderM/", source_path=None, s3_landing_path="s3://purgo-bucket/landingM/", s3_archive_path="s3://purgo-bucket/archiveM/",
-        delta_load_ts="2024-04-02T00:00:00.000+0000", full_or_incremental_load="FULL", zip_file="N", vendor="VendorM", delimiter=",", source_landing=None,
-        src_landing_table_name=None, publish_unstitched=None, publish_unstitched_table_name=None, publish_stitched=None, publish_stitched_table_name=None,
-        primary_key=None, header="Y", date_pattern=None, actual_file_name=None, vendor_file_deletion_flag=None, file_recursive_flag="N", total_weeks_req_data=None,
-        total_weeks_file_data=None, active_flag="A"),
-    Row(config_id="601", source_object_name="objN", source_system="sysN", file_name="fileK.csv", frequency="DAILY", location="locN", domain="domN", sub_domain="subN",
-        s3_vendor_path="s3://vendor-bucket/folderN/", source_path=None, s3_landing_path="s3://purgo-bucket/landingN/", s3_archive_path="s3://purgo-bucket/archiveN/",
-        delta_load_ts="2024-04-03T00:00:00.000+0000", full_or_incremental_load="FULL", zip_file="N", vendor="VendorN", delimiter=",", source_landing=None,
-        src_landing_table_name=None, publish_unstitched=None, publish_unstitched_table_name=None, publish_stitched=None, publish_stitched_table_name=None,
-        primary_key=None, header="Y", date_pattern=None, actual_file_name=None, vendor_file_deletion_flag=None, file_recursive_flag="N", total_weeks_req_data=None,
-        total_weeks_file_data=None, active_flag="A"),
-    # Special/multibyte chars
-    Row(config_id="777", source_object_name="objΩ", source_system="sysΩ", file_name="spécial_文件.csv", frequency="DAILY", location="locΩ", domain="domΩ", sub_domain="subΩ",
-        s3_vendor_path="s3://vendor-bucket/folderΩ/", source_path=None, s3_landing_path="s3://purgo-bucket/landingΩ/", s3_archive_path="s3://purgo-bucket/archiveΩ/",
-        delta_load_ts="2024-04-04T00:00:00.000+0000", full_or_incremental_load="FULL", zip_file="N", vendor="VendorΩ", delimiter=";", source_landing=None,
-        src_landing_table_name=None, publish_unstitched=None, publish_unstitched_table_name=None, publish_stitched=None, publish_stitched_table_name=None,
-        primary_key=None, header="Y", date_pattern=None, actual_file_name=None, vendor_file_deletion_flag=None, file_recursive_flag="N", total_weeks_req_data=None,
-        total_weeks_file_data=None, active_flag="A"),
-    # NULLs and edge
-    Row(config_id=None, source_object_name=None, source_system=None, file_name=None, frequency=None, location=None, domain=None, sub_domain=None,
-        s3_vendor_path=None, source_path=None, s3_landing_path=None, s3_archive_path=None,
+    # Happy path: active config, valid S3 URIs, non-null, non-empty, recursive
+    Row(config_id="1", source_object_name="objA", source_system="sysA", file_name="fileA.csv", frequency="daily", location="locA", domain="domA", sub_domain="subA",
+        s3_vendor_path="s3://vendor-bucket/folder1/", source_path=None, s3_landing_path="s3://purgo-bucket/landing1/", s3_archive_path="s3://purgo-bucket/archive1/",
+        delta_load_ts="2024-03-21T00:00:00.000+0000", full_or_incremental_load="F", zip_file="N", vendor="VendorA", delimiter=",", source_landing="Y",
+        src_landing_table_name="tableA", publish_unstitched="N", publish_unstitched_table_name=None, publish_stitched="Y", publish_stitched_table_name="stitchedA",
+        primary_key="id", header="Y", date_pattern="yyyy-MM-dd", actual_file_name="fileA.csv", vendor_file_deletion_flag="N", file_recursive_flag="Y",
+        total_weeks_req_data="4", total_weeks_file_data="4", active_flag="A"),
+    # Happy path: active config, non-recursive
+    Row(config_id="2", source_object_name="objB", source_system="sysB", file_name="fileB.csv", frequency="weekly", location="locB", domain="domB", sub_domain="subB",
+        s3_vendor_path="s3://vendor-bucket/folder2/", source_path=None, s3_landing_path="s3://purgo-bucket/landing2/", s3_archive_path="s3://purgo-bucket/archive2/",
+        delta_load_ts="2024-03-22T00:00:00.000+0000", full_or_incremental_load="I", zip_file="Y", vendor="VendorB", delimiter="|", source_landing="N",
+        src_landing_table_name="tableB", publish_unstitched="Y", publish_unstitched_table_name="unstitchB", publish_stitched="N", publish_stitched_table_name=None,
+        primary_key="pk", header="N", date_pattern="MM/dd/yyyy", actual_file_name="fileB.csv", vendor_file_deletion_flag="Y", file_recursive_flag=None,
+        total_weeks_req_data="2", total_weeks_file_data="2", active_flag="A"),
+    # Edge: inactive config, should not be processed
+    Row(config_id="3", source_object_name="objC", source_system="sysC", file_name="fileC.csv", frequency="monthly", location="locC", domain="domC", sub_domain="subC",
+        s3_vendor_path="s3://vendor-bucket/folder3/", source_path=None, s3_landing_path="s3://purgo-bucket/landing3/", s3_archive_path="s3://purgo-bucket/archive3/",
+        delta_load_ts="2024-03-23T00:00:00.000+0000", full_or_incremental_load="F", zip_file="N", vendor="VendorC", delimiter=";", source_landing="Y",
+        src_landing_table_name="tableC", publish_unstitched="N", publish_unstitched_table_name=None, publish_stitched="Y", publish_stitched_table_name="stitchedC",
+        primary_key="id", header="Y", date_pattern="dd-MM-yyyy", actual_file_name="fileC.csv", vendor_file_deletion_flag="N", file_recursive_flag="N",
+        total_weeks_req_data="1", total_weeks_file_data="1", active_flag="I"),
+    # Edge: active_flag lower-case, should not be processed (case-sensitive)
+    Row(config_id="4", source_object_name="objD", source_system="sysD", file_name="fileD.csv", frequency="hourly", location="locD", domain="domD", sub_domain="subD",
+        s3_vendor_path="s3://vendor-bucket/folder4/", source_path=None, s3_landing_path="s3://purgo-bucket/landing4/", s3_archive_path="s3://purgo-bucket/archive4/",
+        delta_load_ts="2024-03-24T00:00:00.000+0000", full_or_incremental_load="I", zip_file="Y", vendor="VendorD", delimiter="\t", source_landing="N",
+        src_landing_table_name="tableD", publish_unstitched="Y", publish_unstitched_table_name="unstitchD", publish_stitched="N", publish_stitched_table_name=None,
+        primary_key="pk", header="N", date_pattern="yyyy/MM/dd", actual_file_name="fileD.csv", vendor_file_deletion_flag="Y", file_recursive_flag="Y",
+        total_weeks_req_data="3", total_weeks_file_data="3", active_flag="a"),
+    # Error: missing S3 path (null)
+    Row(config_id="5", source_object_name="objE", source_system="sysE", file_name="fileE.csv", frequency="daily", location="locE", domain="domE", sub_domain="subE",
+        s3_vendor_path=None, source_path=None, s3_landing_path="s3://purgo-bucket/landing5/", s3_archive_path="s3://purgo-bucket/archive5/",
+        delta_load_ts="2024-03-25T00:00:00.000+0000", full_or_incremental_load="F", zip_file="N", vendor="VendorE", delimiter=",", source_landing="Y",
+        src_landing_table_name="tableE", publish_unstitched="N", publish_unstitched_table_name=None, publish_stitched="Y", publish_stitched_table_name="stitchedE",
+        primary_key="id", header="Y", date_pattern="yyyy-MM-dd", actual_file_name="fileE.csv", vendor_file_deletion_flag="N", file_recursive_flag="N",
+        total_weeks_req_data="4", total_weeks_file_data="4", active_flag="A"),
+    # Error: missing S3 path (empty string)
+    Row(config_id="6", source_object_name="objF", source_system="sysF", file_name="fileF.csv", frequency="weekly", location="locF", domain="domF", sub_domain="subF",
+        s3_vendor_path="", source_path=None, s3_landing_path="s3://purgo-bucket/landing6/", s3_archive_path="s3://purgo-bucket/archive6/",
+        delta_load_ts="2024-03-26T00:00:00.000+0000", full_or_incremental_load="I", zip_file="Y", vendor="VendorF", delimiter="|", source_landing="N",
+        src_landing_table_name="tableF", publish_unstitched="Y", publish_unstitched_table_name="unstitchF", publish_stitched="N", publish_stitched_table_name=None,
+        primary_key="pk", header="N", date_pattern="MM/dd/yyyy", actual_file_name="fileF.csv", vendor_file_deletion_flag="Y", file_recursive_flag=None,
+        total_weeks_req_data="2", total_weeks_file_data="2", active_flag="A"),
+    # Error: invalid S3 URI
+    Row(config_id="7", source_object_name="objG", source_system="sysG", file_name="fileG.csv", frequency="monthly", location="locG", domain="domG", sub_domain="subG",
+        s3_vendor_path="invalid_path", source_path=None, s3_landing_path="s3://purgo-bucket/landing7/", s3_archive_path="s3://purgo-bucket/archive7/",
+        delta_load_ts="2024-03-27T00:00:00.000+0000", full_or_incremental_load="F", zip_file="N", vendor="VendorG", delimiter=";", source_landing="Y",
+        src_landing_table_name="tableG", publish_unstitched="N", publish_unstitched_table_name=None, publish_stitched="Y", publish_stitched_table_name="stitchedG",
+        primary_key="id", header="Y", date_pattern="dd-MM-yyyy", actual_file_name="fileG.csv", vendor_file_deletion_flag="N", file_recursive_flag="N",
+        total_weeks_req_data="1", total_weeks_file_data="1", active_flag="A"),
+    # Happy path: recursive flag null, should not process subfolders
+    Row(config_id="8", source_object_name="objH", source_system="sysH", file_name="fileH.csv", frequency="hourly", location="locH", domain="domH", sub_domain="subH",
+        s3_vendor_path="s3://vendor-bucket/folder8/", source_path=None, s3_landing_path="s3://purgo-bucket/landing8/", s3_archive_path="s3://purgo-bucket/archive8/",
+        delta_load_ts="2024-03-28T00:00:00.000+0000", full_or_incremental_load="I", zip_file="Y", vendor="VendorH", delimiter="\t", source_landing="N",
+        src_landing_table_name="tableH", publish_unstitched="Y", publish_unstitched_table_name="unstitchH", publish_stitched="N", publish_stitched_table_name=None,
+        primary_key="pk", header="N", date_pattern="yyyy/MM/dd", actual_file_name="fileH.csv", vendor_file_deletion_flag="Y", file_recursive_flag=None,
+        total_weeks_req_data="3", total_weeks_file_data="3", active_flag="A"),
+    # Happy path: special/multibyte chars in file_name and S3 path
+    Row(config_id="9", source_object_name="objI", source_system="sysI", file_name="ファイルI.csv", frequency="daily", location="locI", domain="domI", sub_domain="subI",
+        s3_vendor_path="s3://vendor-bucket/特殊フォルダ/", source_path=None, s3_landing_path="s3://purgo-bucket/ランディング9/", s3_archive_path="s3://purgo-bucket/アーカイブ9/",
+        delta_load_ts="2024-03-29T00:00:00.000+0000", full_or_incremental_load="F", zip_file="N", vendor="VendorI", delimiter=",", source_landing="Y",
+        src_landing_table_name="tableI", publish_unstitched="N", publish_unstitched_table_name=None, publish_stitched="Y", publish_stitched_table_name="stitchedI",
+        primary_key="id", header="Y", date_pattern="yyyy-MM-dd", actual_file_name="ファイルI.csv", vendor_file_deletion_flag="N", file_recursive_flag="Y",
+        total_weeks_req_data="4", total_weeks_file_data="4", active_flag="A"),
+    # Happy path: special chars in file_name
+    Row(config_id="10", source_object_name="objJ", source_system="sysJ", file_name="file!@#$.csv", frequency="weekly", location="locJ", domain="domJ", sub_domain="subJ",
+        s3_vendor_path="s3://vendor-bucket/folder10/", source_path=None, s3_landing_path="s3://purgo-bucket/landing10/", s3_archive_path="s3://purgo-bucket/archive10/",
+        delta_load_ts="2024-03-30T00:00:00.000+0000", full_or_incremental_load="I", zip_file="Y", vendor="VendorJ", delimiter="|", source_landing="N",
+        src_landing_table_name="tableJ", publish_unstitched="Y", publish_unstitched_table_name="unstitchJ", publish_stitched="N", publish_stitched_table_name=None,
+        primary_key="pk", header="N", date_pattern="MM/dd/yyyy", actual_file_name="file!@#$.csv", vendor_file_deletion_flag="Y", file_recursive_flag=None,
+        total_weeks_req_data="2", total_weeks_file_data="2", active_flag="A"),
+    # Edge: NULLs in non-key columns
+    Row(config_id="11", source_object_name=None, source_system=None, file_name=None, frequency=None, location=None, domain=None, sub_domain=None,
+        s3_vendor_path="s3://vendor-bucket/folder11/", source_path=None, s3_landing_path="s3://purgo-bucket/landing11/", s3_archive_path="s3://purgo-bucket/archive11/",
         delta_load_ts=None, full_or_incremental_load=None, zip_file=None, vendor=None, delimiter=None, source_landing=None,
         src_landing_table_name=None, publish_unstitched=None, publish_unstitched_table_name=None, publish_stitched=None, publish_stitched_table_name=None,
-        primary_key=None, header=None, date_pattern=None, actual_file_name=None, vendor_file_deletion_flag=None, file_recursive_flag=None, total_weeks_req_data=None,
-        total_weeks_file_data=None, active_flag=None),
+        primary_key=None, header=None, date_pattern=None, actual_file_name=None, vendor_file_deletion_flag=None, file_recursive_flag=None,
+        total_weeks_req_data=None, total_weeks_file_data=None, active_flag="A"),
+    # Edge: all S3 paths null
+    Row(config_id="12", source_object_name="objL", source_system="sysL", file_name="fileL.csv", frequency="daily", location="locL", domain="domL", sub_domain="subL",
+        s3_vendor_path=None, source_path=None, s3_landing_path=None, s3_archive_path=None,
+        delta_load_ts="2024-03-31T00:00:00.000+0000", full_or_incremental_load="F", zip_file="N", vendor="VendorL", delimiter=",", source_landing="Y",
+        src_landing_table_name="tableL", publish_unstitched="N", publish_unstitched_table_name=None, publish_stitched="Y", publish_stitched_table_name="stitchedL",
+        primary_key="id", header="Y", date_pattern="yyyy-MM-dd", actual_file_name="fileL.csv", vendor_file_deletion_flag="N", file_recursive_flag="N",
+        total_weeks_req_data="4", total_weeks_file_data="4", active_flag="A"),
+    # Edge: all S3 paths empty string
+    Row(config_id="13", source_object_name="objM", source_system="sysM", file_name="fileM.csv", frequency="weekly", location="locM", domain="domM", sub_domain="subM",
+        s3_vendor_path="", source_path=None, s3_landing_path="", s3_archive_path="",
+        delta_load_ts="2024-04-01T00:00:00.000+0000", full_or_incremental_load="I", zip_file="Y", vendor="VendorM", delimiter="|", source_landing="N",
+        src_landing_table_name="tableM", publish_unstitched="Y", publish_unstitched_table_name="unstitchM", publish_stitched="N", publish_stitched_table_name=None,
+        primary_key="pk", header="N", date_pattern="MM/dd/yyyy", actual_file_name="fileM.csv", vendor_file_deletion_flag="Y", file_recursive_flag=None,
+        total_weeks_req_data="2", total_weeks_file_data="2", active_flag="A"),
+    # Edge: active_flag NULL
+    Row(config_id="14", source_object_name="objN", source_system="sysN", file_name="fileN.csv", frequency="monthly", location="locN", domain="domN", sub_domain="subN",
+        s3_vendor_path="s3://vendor-bucket/folder14/", source_path=None, s3_landing_path="s3://purgo-bucket/landing14/", s3_archive_path="s3://purgo-bucket/archive14/",
+        delta_load_ts="2024-04-02T00:00:00.000+0000", full_or_incremental_load="F", zip_file="N", vendor="VendorN", delimiter=";", source_landing="Y",
+        src_landing_table_name="tableN", publish_unstitched="N", publish_unstitched_table_name=None, publish_stitched="Y", publish_stitched_table_name="stitchedN",
+        primary_key="id", header="Y", date_pattern="dd-MM-yyyy", actual_file_name="fileN.csv", vendor_file_deletion_flag="N", file_recursive_flag="N",
+        total_weeks_req_data="1", total_weeks_file_data="1", active_flag=None),
+    # Edge: active_flag empty string
+    Row(config_id="15", source_object_name="objO", source_system="sysO", file_name="fileO.csv", frequency="hourly", location="locO", domain="domO", sub_domain="subO",
+        s3_vendor_path="s3://vendor-bucket/folder15/", source_path=None, s3_landing_path="s3://purgo-bucket/landing15/", s3_archive_path="s3://purgo-bucket/archive15/",
+        delta_load_ts="2024-04-03T00:00:00.000+0000", full_or_incremental_load="I", zip_file="Y", vendor="VendorO", delimiter="\t", source_landing="N",
+        src_landing_table_name="tableO", publish_unstitched="Y", publish_unstitched_table_name="unstitchO", publish_stitched="N", publish_stitched_table_name=None,
+        primary_key="pk", header="N", date_pattern="yyyy/MM/dd", actual_file_name="fileO.csv", vendor_file_deletion_flag="Y", file_recursive_flag="Y",
+        total_weeks_req_data="3", total_weeks_file_data="3", active_flag=""),
+    # Happy path: long S3 path, edge file name
+    Row(config_id="16", source_object_name="objP", source_system="sysP", file_name="fileP.csv", frequency="daily", location="locP", domain="domP", sub_domain="subP",
+        s3_vendor_path="s3://vendor-bucket/very/long/path/with/many/levels/", source_path=None, s3_landing_path="s3://purgo-bucket/landing16/", s3_archive_path="s3://purgo-bucket/archive16/",
+        delta_load_ts="2024-04-04T00:00:00.000+0000", full_or_incremental_load="F", zip_file="N", vendor="VendorP", delimiter=",", source_landing="Y",
+        src_landing_table_name="tableP", publish_unstitched="N", publish_unstitched_table_name=None, publish_stitched="Y", publish_stitched_table_name="stitchedP",
+        primary_key="id", header="Y", date_pattern="yyyy-MM-dd", actual_file_name="fileP.csv", vendor_file_deletion_flag="N", file_recursive_flag="Y",
+        total_weeks_req_data="4", total_weeks_file_data="4", active_flag="A"),
+    # Happy path: file_recursive_flag = "N"
+    Row(config_id="17", source_object_name="objQ", source_system="sysQ", file_name="fileQ.csv", frequency="weekly", location="locQ", domain="domQ", sub_domain="subQ",
+        s3_vendor_path="s3://vendor-bucket/folder17/", source_path=None, s3_landing_path="s3://purgo-bucket/landing17/", s3_archive_path="s3://purgo-bucket/archive17/",
+        delta_load_ts="2024-04-05T00:00:00.000+0000", full_or_incremental_load="I", zip_file="Y", vendor="VendorQ", delimiter="|", source_landing="N",
+        src_landing_table_name="tableQ", publish_unstitched="Y", publish_unstitched_table_name="unstitchQ", publish_stitched="N", publish_stitched_table_name=None,
+        primary_key="pk", header="N", date_pattern="MM/dd/yyyy", actual_file_name="fileQ.csv", vendor_file_deletion_flag="Y", file_recursive_flag="N",
+        total_weeks_req_data="2", total_weeks_file_data="2", active_flag="A"),
+    # Happy path: file_recursive_flag = "Y"
+    Row(config_id="18", source_object_name="objR", source_system="sysR", file_name="fileR.csv", frequency="monthly", location="locR", domain="domR", sub_domain="subR",
+        s3_vendor_path="s3://vendor-bucket/folder18/", source_path=None, s3_landing_path="s3://purgo-bucket/landing18/", s3_archive_path="s3://purgo-bucket/archive18/",
+        delta_load_ts="2024-04-06T00:00:00.000+0000", full_or_incremental_load="F", zip_file="N", vendor="VendorR", delimiter=";", source_landing="Y",
+        src_landing_table_name="tableR", publish_unstitched="N", publish_unstitched_table_name=None, publish_stitched="Y", publish_stitched_table_name="stitchedR",
+        primary_key="id", header="Y", date_pattern="dd-MM-yyyy", actual_file_name="fileR.csv", vendor_file_deletion_flag="N", file_recursive_flag="Y",
+        total_weeks_req_data="1", total_weeks_file_data="1", active_flag="A"),
+    # Happy path: file_recursive_flag = None
+    Row(config_id="19", source_object_name="objS", source_system="sysS", file_name="fileS.csv", frequency="hourly", location="locS", domain="domS", sub_domain="subS",
+        s3_vendor_path="s3://vendor-bucket/folder19/", source_path=None, s3_landing_path="s3://purgo-bucket/landing19/", s3_archive_path="s3://purgo-bucket/archive19/",
+        delta_load_ts="2024-04-07T00:00:00.000+0000", full_or_incremental_load="I", zip_file="Y", vendor="VendorS", delimiter="\t", source_landing="N",
+        src_landing_table_name="tableS", publish_unstitched="Y", publish_unstitched_table_name="unstitchS", publish_stitched="N", publish_stitched_table_name=None,
+        primary_key="pk", header="N", date_pattern="yyyy/MM/dd", actual_file_name="fileS.csv", vendor_file_deletion_flag="Y", file_recursive_flag=None,
+        total_weeks_req_data="3", total_weeks_file_data="3", active_flag="A"),
+    # Happy path: file_name with whitespace and special chars
+    Row(config_id="20", source_object_name="objT", source_system="sysT", file_name="file T 2024-04-08.csv", frequency="daily", location="locT", domain="domT", sub_domain="subT",
+        s3_vendor_path="s3://vendor-bucket/folder20/", source_path=None, s3_landing_path="s3://purgo-bucket/landing20/", s3_archive_path="s3://purgo-bucket/archive20/",
+        delta_load_ts="2024-04-08T00:00:00.000+0000", full_or_incremental_load="F", zip_file="N", vendor="VendorT", delimiter=",", source_landing="Y",
+        src_landing_table_name="tableT", publish_unstitched="N", publish_unstitched_table_name=None, publish_stitched="Y", publish_stitched_table_name="stitchedT",
+        primary_key="id", header="Y", date_pattern="yyyy-MM-dd", actual_file_name="file T 2024-04-08.csv", vendor_file_deletion_flag="N", file_recursive_flag="Y",
+        total_weeks_req_data="4", total_weeks_file_data="4", active_flag="A"),
+    # Edge: file_name is null
+    Row(config_id="21", source_object_name="objU", source_system="sysU", file_name=None, frequency="daily", location="locU", domain="domU", sub_domain="subU",
+        s3_vendor_path="s3://vendor-bucket/folder21/", source_path=None, s3_landing_path="s3://purgo-bucket/landing21/", s3_archive_path="s3://purgo-bucket/archive21/",
+        delta_load_ts="2024-04-09T00:00:00.000+0000", full_or_incremental_load="F", zip_file="N", vendor="VendorU", delimiter=",", source_landing="Y",
+        src_landing_table_name="tableU", publish_unstitched="N", publish_unstitched_table_name=None, publish_stitched="Y", publish_stitched_table_name="stitchedU",
+        primary_key="id", header="Y", date_pattern="yyyy-MM-dd", actual_file_name=None, vendor_file_deletion_flag="N", file_recursive_flag="Y",
+        total_weeks_req_data="4", total_weeks_file_data="4", active_flag="A"),
+    # Edge: file_name is empty string
+    Row(config_id="22", source_object_name="objV", source_system="sysV", file_name="", frequency="daily", location="locV", domain="domV", sub_domain="subV",
+        s3_vendor_path="s3://vendor-bucket/folder22/", source_path=None, s3_landing_path="s3://purgo-bucket/landing22/", s3_archive_path="s3://purgo-bucket/archive22/",
+        delta_load_ts="2024-04-10T00:00:00.000+0000", full_or_incremental_load="F", zip_file="N", vendor="VendorV", delimiter=",", source_landing="Y",
+        src_landing_table_name="tableV", publish_unstitched="N", publish_unstitched_table_name=None, publish_stitched="Y", publish_stitched_table_name="stitchedV",
+        primary_key="id", header="Y", date_pattern="yyyy-MM-dd", actual_file_name="", vendor_file_deletion_flag="N", file_recursive_flag="Y",
+        total_weeks_req_data="4", total_weeks_file_data="4", active_flag="A"),
+    # Edge: config_id is null
+    Row(config_id=None, source_object_name="objW", source_system="sysW", file_name="fileW.csv", frequency="daily", location="locW", domain="domW", sub_domain="subW",
+        s3_vendor_path="s3://vendor-bucket/folder23/", source_path=None, s3_landing_path="s3://purgo-bucket/landing23/", s3_archive_path="s3://purgo-bucket/archive23/",
+        delta_load_ts="2024-04-11T00:00:00.000+0000", full_or_incremental_load="F", zip_file="N", vendor="VendorW", delimiter=",", source_landing="Y",
+        src_landing_table_name="tableW", publish_unstitched="N", publish_unstitched_table_name=None, publish_stitched="Y", publish_stitched_table_name="stitchedW",
+        primary_key="id", header="Y", date_pattern="yyyy-MM-dd", actual_file_name="fileW.csv", vendor_file_deletion_flag="N", file_recursive_flag="Y",
+        total_weeks_req_data="4", total_weeks_file_data="4", active_flag="A"),
+    # Edge: config_id is empty string
+    Row(config_id="", source_object_name="objX", source_system="sysX", file_name="fileX.csv", frequency="daily", location="locX", domain="domX", sub_domain="subX",
+        s3_vendor_path="s3://vendor-bucket/folder24/", source_path=None, s3_landing_path="s3://purgo-bucket/landing24/", s3_archive_path="s3://purgo-bucket/archive24/",
+        delta_load_ts="2024-04-12T00:00:00.000+0000", full_or_incremental_load="F", zip_file="N", vendor="VendorX", delimiter=",", source_landing="Y",
+        src_landing_table_name="tableX", publish_unstitched="N", publish_unstitched_table_name=None, publish_stitched="Y", publish_stitched_table_name="stitchedX",
+        primary_key="id", header="Y", date_pattern="yyyy-MM-dd", actual_file_name="fileX.csv", vendor_file_deletion_flag="N", file_recursive_flag="Y",
+        total_weeks_req_data="4", total_weeks_file_data="4", active_flag="A"),
+    # Edge: file_recursive_flag = "Y", but s3_vendor_path is a subfolder with special chars
+    Row(config_id="25", source_object_name="objY", source_system="sysY", file_name="fileY.csv", frequency="daily", location="locY", domain="domY", sub_domain="subY",
+        s3_vendor_path="s3://vendor-bucket/子フォルダ25/", source_path=None, s3_landing_path="s3://purgo-bucket/landing25/", s3_archive_path="s3://purgo-bucket/archive25/",
+        delta_load_ts="2024-04-13T00:00:00.000+0000", full_or_incremental_load="F", zip_file="N", vendor="VendorY", delimiter=",", source_landing="Y",
+        src_landing_table_name="tableY", publish_unstitched="N", publish_unstitched_table_name=None, publish_stitched="Y", publish_stitched_table_name="stitchedY",
+        primary_key="id", header="Y", date_pattern="yyyy-MM-dd", actual_file_name="fileY.csv", vendor_file_deletion_flag="N", file_recursive_flag="Y",
+        total_weeks_req_data="4", total_weeks_file_data="4", active_flag="A"),
+    # Edge: file_recursive_flag = "N", s3_vendor_path with trailing slash
+    Row(config_id="26", source_object_name="objZ", source_system="sysZ", file_name="fileZ.csv", frequency="daily", location="locZ", domain="domZ", sub_domain="subZ",
+        s3_vendor_path="s3://vendor-bucket/folder26/", source_path=None, s3_landing_path="s3://purgo-bucket/landing26/", s3_archive_path="s3://purgo-bucket/archive26/",
+        delta_load_ts="2024-04-14T00:00:00.000+0000", full_or_incremental_load="F", zip_file="N", vendor="VendorZ", delimiter=",", source_landing="Y",
+        src_landing_table_name="tableZ", publish_unstitched="N", publish_unstitched_table_name=None, publish_stitched="Y", publish_stitched_table_name="stitchedZ",
+        primary_key="id", header="Y", date_pattern="yyyy-MM-dd", actual_file_name="fileZ.csv", vendor_file_deletion_flag="N", file_recursive_flag="N",
+        total_weeks_req_data="4", total_weeks_file_data="4", active_flag="A"),
 ]
 
 ingest_config_master_df = spark.createDataFrame(ingest_config_master_data, schema=ingest_config_master_schema)
-ingest_config_master_df.write.mode("overwrite").format("delta").saveAsTable("purgo_playground.ingest_config_master")
 
-# -------------------------------
-# 2. Test Data for s3_file_process_log
-# -------------------------------
+# Write to Unity Catalog table for test (commented out, as this is test data generation only)
+# ingest_config_master_df.write.format("delta").mode("overwrite").option("overwriteSchema", "true").saveAsTable("purgo_playground.ingest_config_master")
 
-s3_file_process_log_schema = StructType([
-    StructField("file_name", StringType(), True),
-    StructField("s3_vendor_path", StringType(), True),
-    StructField("s3_landing_path", StringType(), True),
-    StructField("s3_archive_path", StringType(), True),
-    StructField("file_status", StringType(), True),
-    StructField("file_processed_date", TimestampType(), True)
-])
-
-s3_file_process_log_data = [
-    # Happy path: file copied
-    Row(file_name="data1.csv", s3_vendor_path="s3://vendor-bucket/folderA/", s3_landing_path="s3://purgo-bucket/landingA/", s3_archive_path="s3://purgo-bucket/archiveA/", file_status="SUCCESS", file_processed_date=None),
-    # Skipped: already exists in Purgo
-    Row(file_name="data2.csv", s3_vendor_path="s3://vendor-bucket/folderA/", s3_landing_path="s3://purgo-bucket/landingA/", s3_archive_path="s3://purgo-bucket/archiveA/", file_status="SKIPPED_EXISTS", file_processed_date=None),
-    # Skipped: inactive config
-    Row(file_name="data3.csv", s3_vendor_path="s3://vendor-bucket/folderB/", s3_landing_path="s3://purgo-bucket/landingB/", s3_archive_path="s3://purgo-bucket/archiveB/", file_status="SKIPPED_INACTIVE", file_processed_date=None),
-    # Skipped: in archive
-    Row(file_name="data4.csv", s3_vendor_path="s3://vendor-bucket/folderC/", s3_landing_path="s3://purgo-bucket/landingC/", s3_archive_path="s3://purgo-bucket/archiveC/", file_status="SKIPPED_ARCHIVED", file_processed_date=None),
-    # Error: missing config
-    Row(file_name="data5.csv", s3_vendor_path=None, s3_landing_path="s3://purgo-bucket/landingD/", s3_archive_path="s3://purgo-bucket/archiveD/", file_status="ERROR_CONFIG", file_processed_date=None),
-    # Case-sensitive: only Data6.CSV copied
-    Row(file_name="Data6.CSV", s3_vendor_path="s3://vendor-bucket/folderE/", s3_landing_path="s3://purgo-bucket/landingE/", s3_archive_path="s3://purgo-bucket/archiveE/", file_status="SUCCESS", file_processed_date=None),
-    Row(file_name="data6.csv", s3_vendor_path="s3://vendor-bucket/folderE/", s3_landing_path="s3://purgo-bucket/landingE/", s3_archive_path="s3://purgo-bucket/archiveE/", file_status="SKIPPED_NOT_CONFIGURED", file_processed_date=None),
-    # Data-driven
-    Row(file_name="fileA.csv", s3_vendor_path="s3://vendor-bucket/folderF/", s3_landing_path="s3://purgo-bucket/landingF/", s3_archive_path="s3://purgo-bucket/archiveF/", file_status="SUCCESS", file_processed_date=None),
-    Row(file_name="fileB.csv", s3_vendor_path="s3://vendor-bucket/folderG/", s3_landing_path="s3://purgo-bucket/landingG/", s3_archive_path="s3://purgo-bucket/archiveG/", file_status="SKIPPED_EXISTS", file_processed_date=None),
-    Row(file_name="fileC.csv", s3_vendor_path="s3://vendor-bucket/folderH/", s3_landing_path="s3://purgo-bucket/landingH/", s3_archive_path="s3://purgo-bucket/archiveH/", file_status="SKIPPED_ARCHIVED", file_processed_date=None),
-    Row(file_name="fileD.csv", s3_vendor_path="s3://vendor-bucket/folderI/", s3_landing_path="s3://purgo-bucket/landingI/", s3_archive_path="s3://purgo-bucket/archiveI/", file_status="SKIPPED_INACTIVE", file_processed_date=None),
-    Row(file_name="fileF.csv", s3_vendor_path="s3://vendor-bucket/folderJ/", s3_landing_path="s3://purgo-bucket/landingJ/", s3_archive_path="s3://purgo-bucket/archiveJ/", file_status="SKIPPED_NOT_CONFIGURED", file_processed_date=None),
-    # Logging scenario
-    Row(file_name="file1.csv", s3_vendor_path="s3://vendor-bucket/folderX/", s3_landing_path="s3://purgo-bucket/landingX/", s3_archive_path="s3://purgo-bucket/archiveX/", file_status="SUCCESS", file_processed_date=None),
-    Row(file_name="file2.csv", s3_vendor_path="s3://vendor-bucket/folderX/", s3_landing_path="s3://purgo-bucket/landingX/", s3_archive_path="s3://purgo-bucket/archiveX/", file_status="SKIPPED_EXISTS", file_processed_date=None),
-    Row(file_name="file3.csv", s3_vendor_path="s3://vendor-bucket/folderX/", s3_landing_path="s3://purgo-bucket/landingX/", s3_archive_path="s3://purgo-bucket/archiveX/", file_status="SKIPPED_INACTIVE", file_processed_date=None),
-    # Subfolder edge
-    Row(file_name="fileG.csv", s3_vendor_path="s3://vendor-bucket/folderK/", s3_landing_path="s3://purgo-bucket/landingK/", s3_archive_path="s3://purgo-bucket/archiveK/", file_status="SUCCESS", file_processed_date=None),
-    # S3 access error
-    Row(file_name="fileI.csv", s3_vendor_path="s3://vendor-bucket/folderL/", s3_landing_path="s3://purgo-bucket/landingL/", s3_archive_path="s3://purgo-bucket/archiveL/", file_status="ERROR_S3_ACCESS", file_processed_date=None),
-    # No eligible files
-    # Special/multibyte
-    Row(file_name="spécial_文件.csv", s3_vendor_path="s3://vendor-bucket/folderΩ/", s3_landing_path="s3://purgo-bucket/landingΩ/", s3_archive_path="s3://purgo-bucket/archiveΩ/", file_status="SUCCESS", file_processed_date=None),
-    # NULLs
-    Row(file_name=None, s3_vendor_path=None, s3_landing_path=None, s3_archive_path=None, file_status=None, file_processed_date=None),
-]
-
-s3_file_process_log_df = spark.createDataFrame(s3_file_process_log_data, schema=s3_file_process_log_schema)
-s3_file_process_log_df = s3_file_process_log_df.withColumn("file_processed_date", current_timestamp())
-s3_file_process_log_df.write.mode("overwrite").format("delta").saveAsTable("purgo_playground.s3_file_process_log")
-
-# -------------------------------
-# 3. Simulated S3 Folder/File Listings (as DataFrames for test logic)
-# -------------------------------
-
-# Vendor S3 folder simulation
-vendor_s3_files = [
-    # folderA
-    Row(s3_path="s3://vendor-bucket/folderA/", file_name="data1.csv"),
-    Row(s3_path="s3://vendor-bucket/folderA/", file_name="data2.csv"),
-    # folderB
-    Row(s3_path="s3://vendor-bucket/folderB/", file_name="data3.csv"),
-    # folderC
-    Row(s3_path="s3://vendor-bucket/folderC/", file_name="data4.csv"),
-    # folderE (case-sensitive)
-    Row(s3_path="s3://vendor-bucket/folderE/", file_name="data6.csv"),
-    Row(s3_path="s3://vendor-bucket/folderE/", file_name="Data6.CSV"),
-    # folderF-J
-    Row(s3_path="s3://vendor-bucket/folderF/", file_name="fileA.csv"),
-    Row(s3_path="s3://vendor-bucket/folderG/", file_name="fileB.csv"),
-    Row(s3_path="s3://vendor-bucket/folderH/", file_name="fileC.csv"),
-    Row(s3_path="s3://vendor-bucket/folderI/", file_name="fileD.csv"),
-    Row(s3_path="s3://vendor-bucket/folderJ/", file_name="fileF.csv"),
-    # folderK (subfolder edge)
-    Row(s3_path="s3://vendor-bucket/folderK/", file_name="fileG.csv"),
-    Row(s3_path="s3://vendor-bucket/folderK/", file_name="subfolder/fileH.csv"),
-    # folderL (S3 access error)
-    Row(s3_path="s3://vendor-bucket/folderL/", file_name="fileI.csv"),
-    # folderM (no eligible files)
-    # folderN (not in config)
-    Row(s3_path="s3://vendor-bucket/folderN/", file_name="fileL.csv"),
-    # folderΩ (special/multibyte)
-    Row(s3_path="s3://vendor-bucket/folderΩ/", file_name="spécial_文件.csv"),
-]
-
-vendor_s3_files_schema = StructType([
-    StructField("s3_path", StringType(), True),
-    StructField("file_name", StringType(), True)
-])
-vendor_s3_files_df = spark.createDataFrame(vendor_s3_files, schema=vendor_s3_files_schema)
-vendor_s3_files_df.write.mode("overwrite").format("delta").saveAsTable("purgo_playground.test_vendor_s3_files")
-
-# Purgo S3 folder simulation
-purgo_s3_files = [
-    # folderA: data2.csv exists
-    Row(s3_path="s3://purgo-bucket/landingA/", file_name="data2.csv"),
-    # folderG: fileB.csv exists
-    Row(s3_path="s3://purgo-bucket/landingG/", file_name="fileB.csv"),
-    # folderH: empty
-    # folderJ: empty
-    # folderE: empty
-    # folderF: empty
-    # folderK: empty
-    # folderL: empty
-    # folderN: empty
-]
-
-purgo_s3_files_schema = StructType([
-    StructField("s3_path", StringType(), True),
-    StructField("file_name", StringType(), True)
-])
-purgo_s3_files_df = spark.createDataFrame(purgo_s3_files, schema=purgo_s3_files_schema)
-purgo_s3_files_df.write.mode("overwrite").format("delta").saveAsTable("purgo_playground.test_purgo_s3_files")
-
-# Archive S3 folder simulation
-archive_s3_files = [
-    # folderC: data4.csv exists
-    Row(s3_path="s3://purgo-bucket/archiveC/", file_name="data4.csv"),
-    # folderH: fileC.csv exists
-    Row(s3_path="s3://purgo-bucket/archiveH/", file_name="fileC.csv"),
-]
-
-archive_s3_files_schema = StructType([
-    StructField("s3_path", StringType(), True),
-    StructField("file_name", StringType(), True)
-])
-archive_s3_files_df = spark.createDataFrame(archive_s3_files, schema=archive_s3_files_schema)
-archive_s3_files_df.write.mode("overwrite").format("delta").saveAsTable("purgo_playground.test_archive_s3_files")
-
-# -------------------------------
-# 4. Simulated Databricks Secret Scope for AWS Keys (for error case)
-# -------------------------------
-
-# This is a placeholder for secret scope simulation; in real tests, secret access is handled by Databricks.
-# For error case, you can simulate missing keys by not setting them in the test environment.
-
-# -------------------------------
-# 5. Edge/NULL/Special Character Handling
-# -------------------------------
-
-# Already included in above data: NULLs, special/multibyte chars, edge cases, boundary values.
-
-# -------------------------------
-# 6. Validation Query CTE Example (for test validation)
-# -------------------------------
-
-# Example: Validate that all files with file_status='SUCCESS' in s3_file_process_log exist in test_purgo_s3_files
-
-from pyspark.sql import functions as F  
-
-validation_cte = """
-WITH successful_files AS (
-  SELECT file_name, s3_landing_path
-  FROM purgo_playground.s3_file_process_log
-  WHERE file_status = 'SUCCESS'
-)
-SELECT sf.file_name, sf.s3_landing_path, pf.file_name AS exists_in_purgo
-FROM successful_files sf
-LEFT JOIN purgo_playground.test_purgo_s3_files pf
-  ON sf.file_name = pf.file_name AND sf.s3_landing_path = pf.s3_path
-"""
-
-validation_df = spark.sql(validation_cte)
-validation_df.show(truncate=False)
+# Show the generated test data
+ingest_config_master_df.show(truncate=False)
