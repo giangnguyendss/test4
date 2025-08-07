@@ -1,0 +1,301 @@
+Feature: Aggregate compound statistics from purgo_playground.dosage_response_analysis for potency and efficacy analysis
+
+  As a data engineer,
+  I want to aggregate compound-level statistics from the purgo_playground.dosage_response_analysis table,
+  So that I can classify compounds by potency and provide summary metrics for downstream analysis.
+
+  Background:
+    Given the Unity Catalog is purgo_databricks
+    And the schema is purgo_playground
+    And the source table is purgo_playground.dosage_response_analysis
+    And the following columns are available: study_id, compound_id, dose_mg, response_pct, efficacy_score, ic50, auc, approved_flag, date_tested
+
+  # Happy Path: All data present, no nulls, no filtering required
+
+  Scenario: Aggregate statistics for a compound with complete data
+    Given the table contains records for compound_id "CMPD001" with the following values:
+      | dose_mg | response_pct | efficacy_score | ic50 | auc |
+      | 10.0    | 80           | 90             | 1.5  | 120 |
+      | 20.0    | 85           | 92             | 1.7  | 125 |
+      | 15.0    | 82           | 91             | 1.6  | 122 |
+    When the aggregation is performed by groupBy("compound_id")
+    Then the avg_dose_mg for "CMPD001" should be 15.0
+    And the avg_response_pct for "CMPD001" should be 82.33
+    And the avg_efficacy for "CMPD001" should be 91.0
+    And the avg_ic50 for "CMPD001" should be 1.6
+    And the avg_auc for "CMPD001" should be 122.33
+    And the experiment_count for "CMPD001" should be 3
+    And the potency_level for "CMPD001" should be "High"
+
+  # Data-driven: Potency level classification
+
+  Scenario Outline: Classify compound potency level based on avg_ic50
+    Given the table contains records for compound_id "<compound_id>" with ic50 values: <ic50_values>
+    When the aggregation is performed by groupBy("compound_id")
+    Then the avg_ic50 for "<compound_id>" should be <avg_ic50>
+    And the potency_level for "<compound_id>" should be "<potency_level>"
+
+    Examples:
+      | compound_id | ic50_values         | avg_ic50 | potency_level |
+      | CMPD002     | 1.0, 1.5, 1.8       | 1.43     | High          |
+      | CMPD003     | 2.0, 2.5, 3.0, 4.0  | 2.88     | Moderate      |
+      | CMPD004     | 4.1, 5.0, 6.0       | 5.03     | Low           |
+
+  # Error Path: Null values in aggregation columns
+
+  Scenario: Handle null values in dose_mg, response_pct, efficacy_score, ic50, auc
+    Given the table contains records for compound_id "CMPD005" with the following values:
+      | dose_mg | response_pct | efficacy_score | ic50 | auc |
+      | 10.0    | 80           | 90             | 1.5  | 120 |
+      | null    | 85           | null           | 1.7  | 125 |
+      | 15.0    | null         | 91             | null | null |
+    When the aggregation is performed by groupBy("compound_id")
+    Then the avg_dose_mg for "CMPD005" should be 12.5
+    And the avg_response_pct for "CMPD005" should be 82.5
+    And the avg_efficacy for "CMPD005" should be 90.5
+    And the avg_ic50 for "CMPD005" should be 1.6
+    And the avg_auc for "CMPD005" should be 122.5
+    And the experiment_count for "CMPD005" should be 3
+    And null values should be ignored in average calculations
+
+  # Error Path: All values null for a metric
+
+  Scenario: All values null for a metric
+    Given the table contains records for compound_id "CMPD006" with the following values:
+      | dose_mg | response_pct | efficacy_score | ic50 | auc |
+      | null    | null         | null           | null | null |
+      | null    | null         | null           | null | null |
+    When the aggregation is performed by groupBy("compound_id")
+    Then the avg_dose_mg for "CMPD006" should be null
+    And the avg_response_pct for "CMPD006" should be null
+    And the avg_efficacy for "CMPD006" should be null
+    And the avg_ic50 for "CMPD006" should be null
+    And the avg_auc for "CMPD006" should be null
+    And the experiment_count for "CMPD006" should be 2
+    And the potency_level for "CMPD006" should be null
+
+  # Error Path: No records for a compound
+
+  Scenario: No records for a compound
+    Given the table contains no records for compound_id "CMPD007"
+    When the aggregation is performed by groupBy("compound_id")
+    Then no output row should be produced for "CMPD007"
+
+  # Error Path: Invalid data types
+
+  Scenario: Invalid data types in numeric columns
+    Given the table contains a record for compound_id "CMPD008" with dose_mg = "abc" (string)
+    When the aggregation is performed by groupBy("compound_id")
+    Then an error should be raised with message "Invalid data type for dose_mg: expected double"
+
+  # Error Path: Potency level threshold ambiguity
+
+  Scenario Outline: Potency level threshold edge cases
+    Given the table contains records for compound_id "<compound_id>" with ic50 values: <ic50_values>
+    When the aggregation is performed by groupBy("compound_id")
+    Then the avg_ic50 for "<compound_id>" should be <avg_ic50>
+    And the potency_level for "<compound_id>" should be "<potency_level>"
+
+    Examples:
+      | compound_id | ic50_values | avg_ic50 | potency_level |
+      | CMPD009     | 2.0         | 2.0      | Moderate      |
+      | CMPD010     | 4.0         | 4.0      | Moderate      |
+      | CMPD011     | 2.01        | 2.01     | Moderate      |
+      | CMPD012     | 4.01        | 4.01     | Low           |
+      | CMPD013     | 1.99        | 1.99     | High          |
+
+  # Error Path: Filtering by approved_flag
+
+  Scenario: Filtering records by approved_flag
+    Given the table contains records for compound_id "CMPD014" with the following values:
+      | dose_mg | response_pct | efficacy_score | ic50 | auc | approved_flag |
+      | 10.0    | 80           | 90             | 1.5  | 120 | Y            |
+      | 20.0    | 85           | 92             | 1.7  | 125 | N            |
+      | 15.0    | 82           | 91             | 1.6  | 122 | Y            |
+    When the aggregation is performed by groupBy("compound_id") without filtering on approved_flag
+    Then the avg_dose_mg for "CMPD014" should be 15.0
+    And the experiment_count for "CMPD014" should be 3
+    When the aggregation is performed by groupBy("compound_id") with filtering on approved_flag = 'Y'
+    Then the avg_dose_mg for "CMPD014" should be 12.5
+    And the experiment_count for "CMPD014" should be 2
+
+  # Output Format
+
+  Scenario: Output format and columns
+    Given the aggregation is complete for all compounds
+    When the final results are displayed
+    Then the output should be a DataFrame or table with columns:
+      | compound_id | avg_dose_mg | avg_response_pct | avg_efficacy | avg_ic50 | avg_auc | experiment_count | potency_level |
+
+  # Error Path: Output destination not specified
+
+  Scenario: Output destination ambiguity
+    Given the aggregation is complete
+    When the output destination is not specified
+    Then the results should be displayed in the notebook/session
+    And a warning message "No output destination specified; results displayed only" should be shown
+
+  # Error Path: Missing required columns
+
+  Scenario: Missing required columns in source table
+    Given the table purgo_playground.dosage_response_analysis is missing the column "ic50"
+    When the aggregation is attempted
+    Then an error should be raised with message "Required column 'ic50' not found in source table"
+
+  # Error Path: Compound with only null ic50 values
+
+  Scenario: Compound with only null ic50 values
+    Given the table contains records for compound_id "CMPD015" with ic50 values: null, null, null
+    When the aggregation is performed by groupBy("compound_id")
+    Then the avg_ic50 for "CMPD015" should be null
+    And the potency_level for "CMPD015" should be null
+
+  # Error Path: Compound with zero experiments
+
+  Scenario: Compound with zero experiments
+    Given the table contains no records for compound_id "CMPD016"
+    When the aggregation is performed by groupBy("compound_id")
+    Then no output row should be produced for "CMPD016"
+
+  # Error Path: Compound with negative or zero dose_mg
+
+  Scenario Outline: Negative or zero dose_mg values
+    Given the table contains records for compound_id "<compound_id>" with dose_mg values: <dose_mg_values>
+    When the aggregation is performed by groupBy("compound_id")
+    Then the avg_dose_mg for "<compound_id>" should be <avg_dose_mg>
+    And a warning message "<warning_message>" should be shown if any dose_mg <= 0
+
+    Examples:
+      | compound_id | dose_mg_values | avg_dose_mg | warning_message                        |
+      | CMPD017     | 0.0, 10.0      | 5.0         | "Zero or negative dose_mg detected"    |
+      | CMPD018     | -5.0, 15.0     | 5.0         | "Zero or negative dose_mg detected"    |
+      | CMPD019     | 10.0, 20.0     | 15.0        |                                         |
+
+  # Error Path: Compound with non-numeric response_pct
+
+  Scenario: Non-numeric response_pct value
+    Given the table contains a record for compound_id "CMPD020" with response_pct = "eighty" (string)
+    When the aggregation is performed by groupBy("compound_id")
+    Then an error should be raised with message "Invalid data type for response_pct: expected bigint"
+
+  # Error Path: Compound with duplicate records
+
+  Scenario: Compound with duplicate records
+    Given the table contains duplicate records for compound_id "CMPD021"
+    When the aggregation is performed by groupBy("compound_id")
+    Then the experiment_count for "CMPD021" should reflect the total number of records, including duplicates
+
+  # Error Path: Compound with only one record
+
+  Scenario: Compound with a single record
+    Given the table contains one record for compound_id "CMPD022" with dose_mg = 10.0, response_pct = 80, efficacy_score = 90, ic50 = 1.5, auc = 120
+    When the aggregation is performed by groupBy("compound_id")
+    Then the avg_dose_mg for "CMPD022" should be 10.0
+    And the avg_response_pct for "CMPD022" should be 80.0
+    And the avg_efficacy for "CMPD022" should be 90.0
+    And the avg_ic50 for "CMPD022" should be 1.5
+    And the avg_auc for "CMPD022" should be 120.0
+    And the experiment_count for "CMPD022" should be 1
+    And the potency_level for "CMPD022" should be "High"
+
+  # Error Path: Compound with mixed-case approved_flag
+
+  Scenario: Compound with mixed-case approved_flag values
+    Given the table contains records for compound_id "CMPD023" with approved_flag values: "Y", "y", "N", "n"
+    When filtering is applied for approved_flag = 'Y'
+    Then only records with approved_flag = "Y" (case-sensitive) should be included
+
+  # Error Path: Compound with future date_tested
+
+  Scenario: Compound with future date_tested
+    Given the table contains a record for compound_id "CMPD024" with date_tested = "2099-01-01"
+    When the aggregation is performed by groupBy("compound_id")
+    Then the record should be included unless filtering by date is specified
+
+  # Error Path: Compound with non-unique compound_id
+
+  Scenario: Compound with non-unique compound_id values
+    Given the table contains records with compound_id "CMPD025" and "cmpd025"
+    When the aggregation is performed by groupBy("compound_id")
+    Then "CMPD025" and "cmpd025" should be treated as distinct compounds (case-sensitive)
+
+  # Error Path: Compound with missing compound_id
+
+  Scenario: Record with null compound_id
+    Given the table contains a record with compound_id = null
+    When the aggregation is performed by groupBy("compound_id")
+    Then the record should be excluded from the output
+
+  # Error Path: Compound with non-integer efficacy_score
+
+  Scenario: Non-integer efficacy_score value
+    Given the table contains a record for compound_id "CMPD026" with efficacy_score = 90.5 (float)
+    When the aggregation is performed by groupBy("compound_id")
+    Then an error should be raised with message "Invalid data type for efficacy_score: expected bigint"
+
+  # Error Path: Compound with negative efficacy_score
+
+  Scenario: Negative efficacy_score value
+    Given the table contains a record for compound_id "CMPD027" with efficacy_score = -10
+    When the aggregation is performed by groupBy("compound_id")
+    Then the avg_efficacy for "CMPD027" should be -10.0
+    And a warning message "Negative efficacy_score detected" should be shown
+
+  # Error Path: Compound with negative response_pct
+
+  Scenario: Negative response_pct value
+    Given the table contains a record for compound_id "CMPD028" with response_pct = -20
+    When the aggregation is performed by groupBy("compound_id")
+    Then the avg_response_pct for "CMPD028" should be -20.0
+    And a warning message "Negative response_pct detected" should be shown
+
+  # Error Path: Compound with negative ic50
+
+  Scenario: Negative ic50 value
+    Given the table contains a record for compound_id "CMPD029" with ic50 = -1.0
+    When the aggregation is performed by groupBy("compound_id")
+    Then the avg_ic50 for "CMPD029" should be -1.0
+    And a warning message "Negative ic50 detected" should be shown
+
+  # Error Path: Compound with negative auc
+
+  Scenario: Negative auc value
+    Given the table contains a record for compound_id "CMPD030" with auc = -100
+    When the aggregation is performed by groupBy("compound_id")
+    Then the avg_auc for "CMPD030" should be -100.0
+    And a warning message "Negative auc detected" should be shown
+
+  # Error Path: Compound with missing auc column
+
+  Scenario: Missing auc column in source table
+    Given the table purgo_playground.dosage_response_analysis is missing the column "auc"
+    When the aggregation is attempted
+    Then an error should be raised with message "Required column 'auc' not found in source table"
+
+  # Error Path: Compound with missing efficacy_score column
+
+  Scenario: Missing efficacy_score column in source table
+    Given the table purgo_playground.dosage_response_analysis is missing the column "efficacy_score"
+    When the aggregation is attempted
+    Then an error should be raised with message "Required column 'efficacy_score' not found in source table"
+
+  # Error Path: Compound with missing dose_mg column
+
+  Scenario: Missing dose_mg column in source table
+    Given the table purgo_playground.dosage_response_analysis is missing the column "dose_mg"
+    When the aggregation is attempted
+    Then an error should be raised with message "Required column 'dose_mg' not found in source table"
+
+  # Error Path: Compound with missing response_pct column
+
+  Scenario: Missing response_pct column in source table
+    Given the table purgo_playground.dosage_response_analysis is missing the column "response_pct"
+    When the aggregation is attempted
+    Then an error should be raised with message "Required column 'response_pct' not found in source table"
+
+  # Error Path: Compound with missing compound_id column
+
+  Scenario: Missing compound_id column in source table
+    Given the table purgo_playground.dosage_response_analysis is missing the column "compound_id"
+    When the aggregation is attempted
+    Then an error should be raised with message "Required column 'compound_id' not found in source table"
