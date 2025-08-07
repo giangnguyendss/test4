@@ -1,246 +1,181 @@
-Feature: Transfer active files from Vendor S3 bucket to Purgo S3 folder based on configuration in ingest_config_master
+Feature: Databricks PySpark script to transfer eligible files from Vendor S3 bucket to Purgo S3 folder
 
-  As a data engineer,
-  I want a Databricks PySpark script to transfer only active files from the vendor's S3 bucket to the Purgo S3 folder,
-  ensuring files are not already present in either the Purgo or Archive S3 folders,
-  and using S3 paths and active_flag from the ingest_config_master table.
+  The script transfers files from the Vendor S3 bucket to the Purgo S3 folder based on configuration in purgo_playground.ingest_config_master.
+  Only files with active_flag = "A" are eligible. Files already present in either the Purgo S3 folder or the Archive S3 folder are excluded.
+  S3 paths are dynamically retrieved from the configuration table. AWS credentials are securely accessed from Databricks secrets.
 
   Background:
     Given the Databricks Unity Catalog is "purgo_databricks"
     And the Unity Catalog schema is "purgo_playground"
     And the configuration table is "purgo_playground.ingest_config_master"
-    And AWS credentials "access_key" and "secret_key" are stored in Databricks secret scope "aws_keys"
-    And the script retrieves S3 paths from columns "s3_vendor_path", "s3_landing_path", and "s3_archive_path" in ingest_config_master
-    And only rows with "active_flag" = "A" (case-sensitive) in ingest_config_master are considered active
-    And file name matching is performed on the file name only (not full path), case-sensitive, including file extension
-    And only files in the root of the vendor S3 folder are considered (no recursion into subfolders)
-    And the script does not overwrite files in the Purgo S3 folder; such files are skipped
-    And the script does not delete files from the vendor S3 bucket after transfer (copy, not move)
-    And the script does not update any status tables or logs unless specified in the scenario
+    And AWS credentials are retrieved from Databricks secret scope "aws_keys" with keys "access_key" and "secret_key"
+    And the script retrieves s3_vendor_path, s3_landing_path, and s3_archive_path from "purgo_playground.ingest_config_master"
+    And file eligibility is determined by active_flag = "A" in "purgo_playground.ingest_config_master"
+    And file name matching is case-sensitive and includes file extensions
+    And only top-level files are considered (no recursive subfolder processing)
+    And files are copied (not moved) from Vendor S3 to Purgo S3
+    And if a file with the same name exists in Purgo S3, it is skipped (not overwritten)
+    And the script logs all file transfer attempts and results to "purgo_playground.s3_file_process_log" with file_status and file_processed_date
 
-  Scenario: Transfer a single active file that does not exist in Purgo or Archive S3 folders
-    Given ingest_config_master contains a row with
-      | config_id | s3_vendor_path                | s3_landing_path                | s3_archive_path                | active_flag |
-      | "C001"    | "s3://vendor-bucket/folderA/" | "s3://purgo-bucket/landingA/"  | "s3://purgo-bucket/archiveA/"  | "A"         |
-    And the vendor S3 folder "s3://vendor-bucket/folderA/" contains the file "file1.csv"
-    And the Purgo S3 folder "s3://purgo-bucket/landingA/" does not contain "file1.csv"
-    And the Archive S3 folder "s3://purgo-bucket/archiveA/" does not contain "file1.csv"
+  Scenario: Transfer eligible files from Vendor S3 to Purgo S3 (happy path)
+    Given the configuration table contains a record with
+      | config_id | file_name      | s3_vendor_path                | s3_landing_path                | s3_archive_path                | active_flag |
+      | 123       | data1.csv      | s3://vendor-bucket/folderA/   | s3://purgo-bucket/landingA/    | s3://purgo-bucket/archiveA/    | A           |
+    And the Vendor S3 folder "s3://vendor-bucket/folderA/" contains files
+      | file_name   |
+      | data1.csv   |
+      | data2.csv   |
+    And the Purgo S3 folder "s3://purgo-bucket/landingA/" contains files
+      | file_name   |
+      | data2.csv   |
+    And the Archive S3 folder "s3://purgo-bucket/archiveA/" contains files
+      | file_name   |
+      |             |
     When the script is executed
-    Then "file1.csv" is copied from "s3://vendor-bucket/folderA/" to "s3://purgo-bucket/landingA/"
-    And "file1.csv" remains in "s3://vendor-bucket/folderA/"
-    And "file1.csv" does not exist in "s3://purgo-bucket/archiveA/"
-    And no files are overwritten in "s3://purgo-bucket/landingA/"
+    Then the file "data1.csv" is copied from "s3://vendor-bucket/folderA/" to "s3://purgo-bucket/landingA/"
+    And the file "data2.csv" is not copied because it already exists in the Purgo S3 folder
+    And the file "data1.csv" is not present in the Archive S3 folder
+    And the "purgo_playground.s3_file_process_log" table contains a record for "data1.csv" with file_status = "SUCCESS"
+    And the "purgo_playground.s3_file_process_log" table contains a record for "data2.csv" with file_status = "SKIPPED_EXISTS"
 
-  Scenario: Do not transfer file if it already exists in Purgo S3 folder
-    Given ingest_config_master contains a row with
-      | config_id | s3_vendor_path                | s3_landing_path                | s3_archive_path                | active_flag |
-      | "C002"    | "s3://vendor-bucket/folderB/" | "s3://purgo-bucket/landingB/"  | "s3://purgo-bucket/archiveB/"  | "A"         |
-    And the vendor S3 folder "s3://vendor-bucket/folderB/" contains the file "file2.csv"
-    And the Purgo S3 folder "s3://purgo-bucket/landingB/" contains "file2.csv"
+  Scenario: Do not transfer files if active_flag is not "A"
+    Given the configuration table contains a record with
+      | config_id | file_name      | s3_vendor_path                | s3_landing_path                | s3_archive_path                | active_flag |
+      | 124       | data3.csv      | s3://vendor-bucket/folderB/   | s3://purgo-bucket/landingB/    | s3://purgo-bucket/archiveB/    | I           |
+    And the Vendor S3 folder "s3://vendor-bucket/folderB/" contains files
+      | file_name   |
+      | data3.csv   |
     When the script is executed
-    Then "file2.csv" is not copied to "s3://purgo-bucket/landingB/"
-    And "file2.csv" remains in "s3://vendor-bucket/folderB/"
-    And no files are overwritten in "s3://purgo-bucket/landingB/"
+    Then the file "data3.csv" is not copied to "s3://purgo-bucket/landingB/"
+    And the "purgo_playground.s3_file_process_log" table contains a record for "data3.csv" with file_status = "SKIPPED_INACTIVE"
 
-  Scenario: Do not transfer file if it already exists in Archive S3 folder
-    Given ingest_config_master contains a row with
-      | config_id | s3_vendor_path                | s3_landing_path                | s3_archive_path                | active_flag |
-      | "C003"    | "s3://vendor-bucket/folderC/" | "s3://purgo-bucket/landingC/"  | "s3://purgo-bucket/archiveC/"  | "A"         |
-    And the vendor S3 folder "s3://vendor-bucket/folderC/" contains the file "file3.csv"
-    And the Archive S3 folder "s3://purgo-bucket/archiveC/" contains "file3.csv"
+  Scenario: Do not transfer files if already present in Archive S3 folder
+    Given the configuration table contains a record with
+      | config_id | file_name      | s3_vendor_path                | s3_landing_path                | s3_archive_path                | active_flag |
+      | 125       | data4.csv      | s3://vendor-bucket/folderC/   | s3://purgo-bucket/landingC/    | s3://purgo-bucket/archiveC/    | A           |
+    And the Vendor S3 folder "s3://vendor-bucket/folderC/" contains files
+      | file_name   |
+      | data4.csv   |
+    And the Archive S3 folder "s3://purgo-bucket/archiveC/" contains files
+      | file_name   |
+      | data4.csv   |
     When the script is executed
-    Then "file3.csv" is not copied to "s3://purgo-bucket/landingC/"
-    And "file3.csv" remains in "s3://vendor-bucket/folderC/"
-    And no files are overwritten in "s3://purgo-bucket/landingC/"
+    Then the file "data4.csv" is not copied to "s3://purgo-bucket/landingC/"
+    And the "purgo_playground.s3_file_process_log" table contains a record for "data4.csv" with file_status = "SKIPPED_ARCHIVED"
 
-  Scenario: Do not transfer inactive files (active_flag != "A")
-    Given ingest_config_master contains a row with
-      | config_id | s3_vendor_path                | s3_landing_path                | s3_archive_path                | active_flag |
-      | "C004"    | "s3://vendor-bucket/folderD/" | "s3://purgo-bucket/landingD/"  | "s3://purgo-bucket/archiveD/"  | "N"         |
-    And the vendor S3 folder "s3://vendor-bucket/folderD/" contains the file "file4.csv"
+  Scenario: Error when required S3 path is missing in configuration
+    Given the configuration table contains a record with
+      | config_id | file_name      | s3_vendor_path | s3_landing_path | s3_archive_path | active_flag |
+      | 126       | data5.csv      |                | s3://purgo-bucket/landingD/ | s3://purgo-bucket/archiveD/ | A |
     When the script is executed
-    Then "file4.csv" is not copied to "s3://purgo-bucket/landingD/"
-    And "file4.csv" remains in "s3://vendor-bucket/folderD/"
+    Then the script raises an error with message "Missing required S3 path in configuration for config_id 126"
+    And the "purgo_playground.s3_file_process_log" table contains a record for "data5.csv" with file_status = "ERROR_CONFIG"
 
-  Scenario: Do not transfer files if ingest_config_master row is missing required S3 path columns
-    Given ingest_config_master contains a row with
-      | config_id | s3_vendor_path | s3_landing_path | s3_archive_path | active_flag |
-      | "C005"    | null           | "s3://purgo-bucket/landingE/" | "s3://purgo-bucket/archiveE/" | "A" |
-    When the script is executed
-    Then an error is raised with message "Missing required S3 path(s) in ingest_config_master for config_id C005"
-    And no files are transferred
-
-  Scenario: Do not transfer files if AWS credentials are missing or invalid
+  Scenario: Error when AWS credentials are missing or invalid
     Given the Databricks secret scope "aws_keys" does not contain "access_key" or "secret_key"
     When the script is executed
-    Then an error is raised with message "Missing AWS credentials in Databricks secret scope 'aws_keys'"
+    Then the script raises an error with message "AWS credentials not found in Databricks secret scope 'aws_keys'"
     And no files are transferred
+    And the "purgo_playground.s3_file_process_log" table contains no new records
 
-  Scenario Outline: Transfer multiple files, skipping those already present in Purgo or Archive
-    Given ingest_config_master contains a row with
-      | config_id | s3_vendor_path                | s3_landing_path                | s3_archive_path                | active_flag |
-      | "C006"    | "s3://vendor-bucket/folderF/" | "s3://purgo-bucket/landingF/"  | "s3://purgo-bucket/archiveF/"  | "A"         |
-    And the vendor S3 folder "s3://vendor-bucket/folderF/" contains the files
-      | file_name      |
-      | <file_name_1>  |
-      | <file_name_2>  |
-      | <file_name_3>  |
-    And the Purgo S3 folder "s3://purgo-bucket/landingF/" contains the files
-      | file_name      |
-      | <purgo_file_1> |
-    And the Archive S3 folder "s3://purgo-bucket/archiveF/" contains the files
-      | file_name      |
-      | <archive_file_1> |
+  Scenario: File name matching is case-sensitive and includes extension
+    Given the configuration table contains a record with
+      | config_id | file_name      | s3_vendor_path                | s3_landing_path                | s3_archive_path                | active_flag |
+      | 127       | Data6.CSV      | s3://vendor-bucket/folderE/   | s3://purgo-bucket/landingE/    | s3://purgo-bucket/archiveE/    | A           |
+    And the Vendor S3 folder "s3://vendor-bucket/folderE/" contains files
+      | file_name   |
+      | data6.csv   |
+      | Data6.CSV   |
+    And the Purgo S3 folder "s3://purgo-bucket/landingE/" contains files
+      | file_name   |
+      |             |
+    And the Archive S3 folder "s3://purgo-bucket/archiveE/" contains files
+      | file_name   |
+      |             |
     When the script is executed
-    Then only the following files are copied from "s3://vendor-bucket/folderF/" to "s3://purgo-bucket/landingF/"
-      | file_name      |
-      | <expected_file_1> |
-    And no files are overwritten in "s3://purgo-bucket/landingF/"
+    Then only the file "Data6.CSV" is copied to "s3://purgo-bucket/landingE/"
+    And the file "data6.csv" is not copied
+    And the "purgo_playground.s3_file_process_log" table contains a record for "Data6.CSV" with file_status = "SUCCESS"
+    And the "purgo_playground.s3_file_process_log" table contains a record for "data6.csv" with file_status = "SKIPPED_NOT_CONFIGURED"
+
+  Scenario Outline: Data-driven test for multiple eligible and ineligible files
+    Given the configuration table contains a record with
+      | config_id | file_name      | s3_vendor_path                | s3_landing_path                | s3_archive_path                | active_flag |
+      | <config_id> | <file_name>  | <s3_vendor_path>              | <s3_landing_path>              | <s3_archive_path>              | <active_flag> |
+    And the Vendor S3 folder "<s3_vendor_path>" contains files
+      | file_name   |
+      | <vendor_file> |
+    And the Purgo S3 folder "<s3_landing_path>" contains files
+      | file_name   |
+      | <purgo_file> |
+    And the Archive S3 folder "<s3_archive_path>" contains files
+      | file_name   |
+      | <archive_file> |
+    When the script is executed
+    Then the file "<vendor_file>" is <expected_action> in "<s3_landing_path>"
+    And the "purgo_playground.s3_file_process_log" table contains a record for "<vendor_file>" with file_status = "<expected_status>"
 
     Examples:
-      | file_name_1 | file_name_2 | file_name_3 | purgo_file_1 | archive_file_1 | expected_file_1 |
-      | "a.csv"     | "b.csv"     | "c.csv"     | "b.csv"      | "c.csv"        | "a.csv"         |
-      | "x.txt"     | "y.txt"     | "z.txt"     | "z.txt"      | "y.txt"        | "x.txt"         |
+      | config_id | file_name    | s3_vendor_path                | s3_landing_path                | s3_archive_path                | active_flag | vendor_file | purgo_file | archive_file | expected_action | expected_status         |
+      | 201       | fileA.csv    | s3://vendor-bucket/folderF/   | s3://purgo-bucket/landingF/    | s3://purgo-bucket/archiveF/    | A           | fileA.csv   |            |             | copied         | SUCCESS                |
+      | 202       | fileB.csv    | s3://vendor-bucket/folderG/   | s3://purgo-bucket/landingG/    | s3://purgo-bucket/archiveG/    | A           | fileB.csv   | fileB.csv  |             | not copied     | SKIPPED_EXISTS          |
+      | 203       | fileC.csv    | s3://vendor-bucket/folderH/   | s3://purgo-bucket/landingH/    | s3://purgo-bucket/archiveH/    | A           | fileC.csv   |            | fileC.csv   | not copied     | SKIPPED_ARCHIVED        |
+      | 204       | fileD.csv    | s3://vendor-bucket/folderI/   | s3://purgo-bucket/landingI/    | s3://purgo-bucket/archiveI/    | I           | fileD.csv   |            |             | not copied     | SKIPPED_INACTIVE        |
+      | 205       | fileE.csv    | s3://vendor-bucket/folderJ/   | s3://purgo-bucket/landingJ/    | s3://purgo-bucket/archiveJ/    | A           | fileF.csv   |            |             | not copied     | SKIPPED_NOT_CONFIGURED  |
 
-  Scenario: Do not transfer files in subfolders when file_recursive_flag is not set
-    Given ingest_config_master contains a row with
-      | config_id | s3_vendor_path                | s3_landing_path                | s3_archive_path                | active_flag | file_recursive_flag |
-      | "C007"    | "s3://vendor-bucket/folderG/" | "s3://purgo-bucket/landingG/"  | "s3://purgo-bucket/archiveG/"  | "A"         | null                |
-    And the vendor S3 folder "s3://vendor-bucket/folderG/" contains the files
-      | file_name           |
-      | "rootfile.csv"      |
-      | "subfolder/file5.csv" |
+  Scenario: Log all file transfer attempts and results
+    Given the script processes files "file1.csv", "file2.csv", and "file3.csv"
+    When "file1.csv" is successfully copied, "file2.csv" is skipped due to existence, and "file3.csv" is skipped due to inactive config
+    Then the "purgo_playground.s3_file_process_log" table contains
+      | file_name   | file_status        |
+      | file1.csv   | SUCCESS           |
+      | file2.csv   | SKIPPED_EXISTS    |
+      | file3.csv   | SKIPPED_INACTIVE  |
+
+  Scenario: Do not process files in subfolders (no recursion)
+    Given the configuration table contains a record with
+      | config_id | file_name      | s3_vendor_path                | s3_landing_path                | s3_archive_path                | active_flag |
+      | 301       | fileG.csv      | s3://vendor-bucket/folderK/   | s3://purgo-bucket/landingK/    | s3://purgo-bucket/archiveK/    | A           |
+    And the Vendor S3 folder "s3://vendor-bucket/folderK/" contains files
+      | file_name         |
+      | fileG.csv         |
+      | subfolder/fileH.csv |
     When the script is executed
-    Then only "rootfile.csv" is copied to "s3://purgo-bucket/landingG/"
-    And "subfolder/file5.csv" is not copied
+    Then only the file "fileG.csv" is considered for transfer
+    And the file "subfolder/fileH.csv" is not processed
+    And the "purgo_playground.s3_file_process_log" table contains a record for "fileG.csv"
+    And the "purgo_playground.s3_file_process_log" table does not contain a record for "subfolder/fileH.csv"
 
-  Scenario: Raise error if S3 path is not a valid S3 URI
-    Given ingest_config_master contains a row with
-      | config_id | s3_vendor_path         | s3_landing_path         | s3_archive_path         | active_flag |
-      | "C008"    | "not-a-s3-path"        | "s3://purgo-bucket/landingH/" | "s3://purgo-bucket/archiveH/" | "A" |
+  Scenario: Error when file transfer fails due to S3 permissions
+    Given the configuration table contains a record with
+      | config_id | file_name      | s3_vendor_path                | s3_landing_path                | s3_archive_path                | active_flag |
+      | 401       | fileI.csv      | s3://vendor-bucket/folderL/   | s3://purgo-bucket/landingL/    | s3://purgo-bucket/archiveL/    | A           |
+    And the Vendor S3 folder "s3://vendor-bucket/folderL/" contains files
+      | file_name   |
+      | fileI.csv   |
+    And the script does not have permission to read from "s3://vendor-bucket/folderL/"
     When the script is executed
-    Then an error is raised with message "Invalid S3 URI in ingest_config_master for config_id C008"
-    And no files are transferred
+    Then the script raises an error with message "S3 access denied for s3://vendor-bucket/folderL/"
+    And the "purgo_playground.s3_file_process_log" table contains a record for "fileI.csv" with file_status = "ERROR_S3_ACCESS"
 
-  Scenario: Do not transfer files if no active configuration exists
-    Given ingest_config_master contains no rows with active_flag = "A"
+  Scenario: No eligible files to transfer
+    Given the configuration table contains a record with
+      | config_id | file_name      | s3_vendor_path                | s3_landing_path                | s3_archive_path                | active_flag |
+      | 501       | fileJ.csv      | s3://vendor-bucket/folderM/   | s3://purgo-bucket/landingM/    | s3://purgo-bucket/archiveM/    | A           |
+    And the Vendor S3 folder "s3://vendor-bucket/folderM/" contains files
+      | file_name   |
+      |             |
     When the script is executed
     Then no files are transferred
+    And the "purgo_playground.s3_file_process_log" table contains no new records
 
-  Scenario: Do not transfer files if vendor S3 folder is empty
-    Given ingest_config_master contains a row with
-      | config_id | s3_vendor_path                | s3_landing_path                | s3_archive_path                | active_flag |
-      | "C009"    | "s3://vendor-bucket/folderI/" | "s3://purgo-bucket/landingI/"  | "s3://purgo-bucket/archiveI/"  | "A"         |
-    And the vendor S3 folder "s3://vendor-bucket/folderI/" is empty
+  Scenario: File is not transferred if not listed in configuration
+    Given the configuration table contains a record with
+      | config_id | file_name      | s3_vendor_path                | s3_landing_path                | s3_archive_path                | active_flag |
+      | 601       | fileK.csv      | s3://vendor-bucket/folderN/   | s3://purgo-bucket/landingN/    | s3://purgo-bucket/archiveN/    | A           |
+    And the Vendor S3 folder "s3://vendor-bucket/folderN/" contains files
+      | file_name   |
+      | fileL.csv   |
     When the script is executed
-    Then no files are transferred
-
-  Scenario: Do not transfer files if file name is null or empty
-    Given ingest_config_master contains a row with
-      | config_id | s3_vendor_path                | s3_landing_path                | s3_archive_path                | active_flag |
-      | "C010"    | "s3://vendor-bucket/folderJ/" | "s3://purgo-bucket/landingJ/"  | "s3://purgo-bucket/archiveJ/"  | "A"         |
-    And the vendor S3 folder "s3://vendor-bucket/folderJ/" contains a file with no name or an empty string as name
-    When the script is executed
-    Then an error is raised with message "Invalid file name encountered in vendor S3 folder for config_id C010"
-    And no files are transferred for that file
-
-  Scenario: Do not transfer files if file name contains invalid characters
-    Given ingest_config_master contains a row with
-      | config_id | s3_vendor_path                | s3_landing_path                | s3_archive_path                | active_flag |
-      | "C011"    | "s3://vendor-bucket/folderK/" | "s3://purgo-bucket/landingK/"  | "s3://purgo-bucket/archiveK/"  | "A"         |
-    And the vendor S3 folder "s3://vendor-bucket/folderK/" contains the file "file:invalid.csv"
-    When the script is executed
-    Then an error is raised with message "Invalid file name 'file:invalid.csv' in vendor S3 folder for config_id C011"
-    And "file:invalid.csv" is not transferred
-
-  Scenario: Do not transfer files if file extension is not allowed (e.g., only .csv and .txt allowed)
-    Given ingest_config_master contains a row with
-      | config_id | s3_vendor_path                | s3_landing_path                | s3_archive_path                | active_flag |
-      | "C012"    | "s3://vendor-bucket/folderL/" | "s3://purgo-bucket/landingL/"  | "s3://purgo-bucket/archiveL/"  | "A"         |
-    And the vendor S3 folder "s3://vendor-bucket/folderL/" contains the file "file6.exe"
-    When the script is executed
-    Then "file6.exe" is not transferred
-    And a warning is logged with message "File extension '.exe' not allowed for file6.exe in config_id C012"
-
-  Scenario: Transfer files for multiple active configurations
-    Given ingest_config_master contains the following rows
-      | config_id | s3_vendor_path                | s3_landing_path                | s3_archive_path                | active_flag |
-      | "C013"    | "s3://vendor-bucket/folderM/" | "s3://purgo-bucket/landingM/"  | "s3://purgo-bucket/archiveM/"  | "A"         |
-      | "C014"    | "s3://vendor-bucket/folderN/" | "s3://purgo-bucket/landingN/"  | "s3://purgo-bucket/archiveN/"  | "A"         |
-    And the vendor S3 folder "s3://vendor-bucket/folderM/" contains the file "file7.csv"
-    And the vendor S3 folder "s3://vendor-bucket/folderN/" contains the file "file8.csv"
-    And neither file exists in their respective Purgo or Archive S3 folders
-    When the script is executed
-    Then "file7.csv" is copied to "s3://purgo-bucket/landingM/"
-    And "file8.csv" is copied to "s3://purgo-bucket/landingN/"
-
-  Scenario: Raise error if Databricks secret scope is not accessible
-    Given the Databricks secret scope "aws_keys" is not accessible due to permissions
-    When the script is executed
-    Then an error is raised with message "Unable to access Databricks secret scope 'aws_keys' for AWS credentials"
-    And no files are transferred
-
-  Scenario: Raise error if S3 access fails due to invalid credentials
-    Given the Databricks secret scope "aws_keys" contains invalid "access_key" or "secret_key"
-    When the script is executed
-    Then an error is raised with message "Failed to authenticate to S3 with provided credentials"
-    And no files are transferred
-
-  Scenario: Raise error if S3 bucket or folder does not exist
-    Given ingest_config_master contains a row with
-      | config_id | s3_vendor_path                | s3_landing_path                | s3_archive_path                | active_flag |
-      | "C015"    | "s3://nonexistent-bucket/folderO/" | "s3://purgo-bucket/landingO/"  | "s3://purgo-bucket/archiveO/"  | "A"         |
-    When the script is executed
-    Then an error is raised with message "S3 bucket or folder 's3://nonexistent-bucket/folderO/' does not exist for config_id C015"
-    And no files are transferred
-
-  Scenario: Do not transfer files if file name matches in a case-insensitive manner (case-sensitive match required)
-    Given ingest_config_master contains a row with
-      | config_id | s3_vendor_path                | s3_landing_path                | s3_archive_path                | active_flag |
-      | "C016"    | "s3://vendor-bucket/folderP/" | "s3://purgo-bucket/landingP/"  | "s3://purgo-bucket/archiveP/"  | "A"         |
-    And the vendor S3 folder "s3://vendor-bucket/folderP/" contains the file "File9.csv"
-    And the Purgo S3 folder "s3://purgo-bucket/landingP/" contains "file9.csv"
-    When the script is executed
-    Then "File9.csv" is copied to "s3://purgo-bucket/landingP/"
-    And "file9.csv" is not overwritten
-
-  Scenario: Do not transfer files if ingest_config_master row is missing active_flag
-    Given ingest_config_master contains a row with
-      | config_id | s3_vendor_path                | s3_landing_path                | s3_archive_path                | active_flag |
-      | "C017"    | "s3://vendor-bucket/folderQ/" | "s3://purgo-bucket/landingQ/"  | "s3://purgo-bucket/archiveQ/"  | null        |
-    When the script is executed
-    Then no files are transferred for config_id "C017"
-
-  Scenario: Do not transfer files if ingest_config_master row has active_flag not equal to "A" (e.g., "Y", "1", "true")
-    Given ingest_config_master contains a row with
-      | config_id | s3_vendor_path                | s3_landing_path                | s3_archive_path                | active_flag |
-      | "C018"    | "s3://vendor-bucket/folderR/" | "s3://purgo-bucket/landingR/"  | "s3://purgo-bucket/archiveR/"  | "Y"         |
-    When the script is executed
-    Then no files are transferred for config_id "C018"
-
-  Scenario: Do not transfer files if file name is duplicated in vendor S3 folder
-    Given ingest_config_master contains a row with
-      | config_id | s3_vendor_path                | s3_landing_path                | s3_archive_path                | active_flag |
-      | "C019"    | "s3://vendor-bucket/folderS/" | "s3://purgo-bucket/landingS/"  | "s3://purgo-bucket/archiveS/"  | "A"         |
-    And the vendor S3 folder "s3://vendor-bucket/folderS/" contains two files with the same name "file10.csv"
-    When the script is executed
-    Then an error is raised with message "Duplicate file name 'file10.csv' found in vendor S3 folder for config_id C019"
-    And "file10.csv" is not transferred
-
-  Scenario: Do not transfer files if file size is zero bytes
-    Given ingest_config_master contains a row with
-      | config_id | s3_vendor_path                | s3_landing_path                | s3_archive_path                | active_flag |
-      | "C020"    | "s3://vendor-bucket/folderT/" | "s3://purgo-bucket/landingT/"  | "s3://purgo-bucket/archiveT/"  | "A"         |
-    And the vendor S3 folder "s3://vendor-bucket/folderT/" contains the file "file11.csv" with size 0 bytes
-    When the script is executed
-    Then "file11.csv" is not transferred
-    And a warning is logged with message "File 'file11.csv' in vendor S3 folder for config_id C020 is empty and was skipped"
-
-  Scenario: Do not transfer files if file name contains whitespace at start or end
-    Given ingest_config_master contains a row with
-      | config_id | s3_vendor_path                | s3_landing_path                | s3_archive_path                | active_flag |
-      | "C021"    | "s3://vendor-bucket/folderU/" | "s3://purgo-bucket/landingU/"  | "s3://purgo-bucket/archiveU/"  | "A"         |
-    And the vendor S3 folder "s3://vendor-bucket/folderU/" contains the file " file12.csv "
-    When the script is executed
-    Then an error is raised with message "File name ' file12.csv ' contains leading or trailing whitespace in vendor S3 folder for config_id C021"
-    And " file12.csv " is not transferred
+    Then the file "fileL.csv" is not transferred
+    And the "purgo_playground.s3_file_process_log" table contains a record for "fileL.csv" with file_status = "SKIPPED_NOT_CONFIGURED"
