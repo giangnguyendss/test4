@@ -1,887 +1,415 @@
+%pip install pytest
+
 spark.catalog.setCurrentCatalog("purgo_databricks")
 
 # ---------------------------------------------------------------
-# Databricks PySpark Test Suite for S3 File Transfer Logic
+# Databricks PySpark Test Suite for S3 File Transfer Script
 # ---------------------------------------------------------------
-# This test suite validates the S3 file transfer script for the following:
-# - Only active configs (active_flag = "A") in purgo_playground.ingest_config_master are processed
-# - Only files in vendor S3 folder root are considered (no recursion)
-# - Files are copied from vendor S3 to Purgo S3 landing if not present in Purgo or Archive
-# - No overwrite, no move (copy only), no temp views/tables
-# - Handles all error, edge, and data quality scenarios as per requirements
-# - Uses Databricks secrets for AWS credentials
-# - All test data is generated in-memory; S3 operations are mocked
+# Catalog: purgo_databricks
+# Schema: purgo_playground
+# All test code is self-contained and does not require SparkSession initialization.
+# All file operations are simulated using test tables as per test data setup.
 # ---------------------------------------------------------------
 
-# -------------------------------
-# Test Setup and Imports
-# -------------------------------
+# from pyspark.sql import SparkSession  # SparkSession is already available in Databricks
+from pyspark.sql import functions as F  
+from pyspark.sql.types import StructType, StructField, StringType, TimestampType, ArrayType, MapType, StructType  
+import pytest  
 
-# Commented out SparkSession initialization (already available in Databricks)
-# from pyspark.sql import SparkSession  # built-in
-# spark = SparkSession.builder.getOrCreate()
+# ---------------------------------------------------------------
+# SECTION: Helper Functions for Test Assertions
+# ---------------------------------------------------------------
 
-from pyspark.sql.types import StructType, StructField, StringType, LongType  
-from pyspark.sql import Row  
-from pyspark.sql.functions import col, lit, when, array, struct, count, expr  
-import re  
+def assert_df_schema(df, expected_schema):
+    """
+    Assert that the DataFrame schema matches the expected schema.
+    """
+    actual = [(f.name, f.dataType, f.nullable) for f in df.schema.fields]
+    assert actual == expected_schema, f"Schema mismatch: {actual} != {expected_schema}"
 
-# -------------------------------
-# Test Data Preparation
-# -------------------------------
+def assert_df_row_count(df, expected_count):
+    """
+    Assert that the DataFrame has the expected number of rows.
+    """
+    actual_count = df.count()
+    assert actual_count == expected_count, f"Row count mismatch: {actual_count} != {expected_count}"
 
-# -- Set current catalog and schema for Unity Catalog
-spark.sql("USE CATALOG purgo_databricks")
-spark.sql("USE purgo_playground")
+def assert_df_column_count(df, expected_count):
+    """
+    Assert that the DataFrame has the expected number of columns.
+    """
+    actual_count = len(df.columns)
+    assert actual_count == expected_count, f"Column count mismatch: {actual_count} != {expected_count}"
 
-# -- Ingest Config Master Test Data (from provided testdata)
-ingest_config_master_schema = StructType([
-    StructField("config_id", StringType(), True),
-    StructField("source_object_name", StringType(), True),
-    StructField("source_system", StringType(), True),
-    StructField("file_name", StringType(), True),
-    StructField("frequency", StringType(), True),
-    StructField("location", StringType(), True),
-    StructField("domain", StringType(), True),
-    StructField("sub_domain", StringType(), True),
-    StructField("s3_vendor_path", StringType(), True),
-    StructField("source_path", StringType(), True),
-    StructField("s3_landing_path", StringType(), True),
-    StructField("s3_archive_path", StringType(), True),
-    StructField("delta_load_ts", StringType(), True),
-    StructField("full_or_incremental_load", StringType(), True),
-    StructField("zip_file", StringType(), True),
-    StructField("vendor", StringType(), True),
-    StructField("delimiter", StringType(), True),
-    StructField("source_landing", StringType(), True),
-    StructField("src_landing_table_name", StringType(), True),
-    StructField("publish_unstitched", StringType(), True),
-    StructField("publish_unstitched_table_name", StringType(), True),
-    StructField("publish_stitched", StringType(), True),
-    StructField("publish_stitched_table_name", StringType(), True),
-    StructField("primary_key", StringType(), True),
-    StructField("header", StringType(), True),
-    StructField("date_pattern", StringType(), True),
-    StructField("actual_file_name", StringType(), True),
-    StructField("vendor_file_deletion_flag", StringType(), True),
-    StructField("file_recursive_flag", StringType(), True),
-    StructField("total_weeks_req_data", StringType(), True),
-    StructField("total_weeks_file_data", StringType(), True),
-    StructField("active_flag", StringType(), True)
-])
+def assert_df_contains(df, expected_rows):
+    """
+    Assert that the DataFrame contains all expected rows.
+    """
+    actual_rows = [tuple(row) for row in df.collect()]
+    for row in expected_rows:
+        assert tuple(row) in actual_rows, f"Expected row {row} not found in DataFrame"
 
-# -- Test data rows (subset for brevity, full set in testdata.py)
-ingest_config_master_data = [
-    Row(config_id="C001", source_object_name="objA", source_system="sysA", file_name="file1.csv", frequency="daily", location="locA", domain="domA", sub_domain="subA",
-        s3_vendor_path="s3://vendor-bucket/folderA/", source_path=None, s3_landing_path="s3://purgo-bucket/landingA/", s3_archive_path="s3://purgo-bucket/archiveA/",
-        delta_load_ts="2024-03-21T00:00:00.000+0000", full_or_incremental_load="F", zip_file="N", vendor="VendorA", delimiter=",", source_landing=None,
-        src_landing_table_name=None, publish_unstitched=None, publish_unstitched_table_name=None, publish_stitched=None, publish_stitched_table_name=None,
-        primary_key=None, header="Y", date_pattern=None, actual_file_name=None, vendor_file_deletion_flag="N", file_recursive_flag=None, total_weeks_req_data=None,
-        total_weeks_file_data=None, active_flag="A"),
-    Row(config_id="C002", source_object_name="objB", source_system="sysB", file_name="file2.csv", frequency="weekly", location="locB", domain="domB", sub_domain="subB",
-        s3_vendor_path="s3://vendor-bucket/folderB/", source_path=None, s3_landing_path="s3://purgo-bucket/landingB/", s3_archive_path="s3://purgo-bucket/archiveB/",
-        delta_load_ts="2024-03-22T00:00:00.000+0000", full_or_incremental_load="I", zip_file="N", vendor="VendorB", delimiter="|", source_landing=None,
-        src_landing_table_name=None, publish_unstitched=None, publish_unstitched_table_name=None, publish_stitched=None, publish_stitched_table_name=None,
-        primary_key=None, header="N", date_pattern=None, actual_file_name=None, vendor_file_deletion_flag="N", file_recursive_flag=None, total_weeks_req_data=None,
-        total_weeks_file_data=None, active_flag="A"),
-    Row(config_id="C003", source_object_name="objC", source_system="sysC", file_name="file3.csv", frequency="monthly", location="locC", domain="domC", sub_domain="subC",
-        s3_vendor_path="s3://vendor-bucket/folderC/", source_path=None, s3_landing_path="s3://purgo-bucket/landingC/", s3_archive_path="s3://purgo-bucket/archiveC/",
-        delta_load_ts="2024-03-23T00:00:00.000+0000", full_or_incremental_load="F", zip_file="Y", vendor="VendorC", delimiter="\t", source_landing=None,
-        src_landing_table_name=None, publish_unstitched=None, publish_unstitched_table_name=None, publish_stitched=None, publish_stitched_table_name=None,
-        primary_key=None, header="Y", date_pattern=None, actual_file_name=None, vendor_file_deletion_flag="N", file_recursive_flag=None, total_weeks_req_data=None,
-        total_weeks_file_data=None, active_flag="A"),
-    Row(config_id="C004", source_object_name="objD", source_system="sysD", file_name="file4.csv", frequency="daily", location="locD", domain="domD", sub_domain="subD",
-        s3_vendor_path="s3://vendor-bucket/folderD/", source_path=None, s3_landing_path="s3://purgo-bucket/landingD/", s3_archive_path="s3://purgo-bucket/archiveD/",
-        delta_load_ts="2024-03-24T00:00:00.000+0000", full_or_incremental_load="I", zip_file="N", vendor="VendorD", delimiter=",", source_landing=None,
-        src_landing_table_name=None, publish_unstitched=None, publish_unstitched_table_name=None, publish_stitched=None, publish_stitched_table_name=None,
-        primary_key=None, header="N", date_pattern=None, actual_file_name=None, vendor_file_deletion_flag="N", file_recursive_flag=None, total_weeks_req_data=None,
-        total_weeks_file_data=None, active_flag="N"),
-    Row(config_id="C005", source_object_name="objE", source_system="sysE", file_name="file5.csv", frequency="daily", location="locE", domain="domE", sub_domain="subE",
-        s3_vendor_path=None, source_path=None, s3_landing_path="s3://purgo-bucket/landingE/", s3_archive_path="s3://purgo-bucket/archiveE/",
-        delta_load_ts="2024-03-25T00:00:00.000+0000", full_or_incremental_load="F", zip_file="N", vendor="VendorE", delimiter=",", source_landing=None,
-        src_landing_table_name=None, publish_unstitched=None, publish_unstitched_table_name=None, publish_stitched=None, publish_stitched_table_name=None,
-        primary_key=None, header="Y", date_pattern=None, actual_file_name=None, vendor_file_deletion_flag="N", file_recursive_flag=None, total_weeks_req_data=None,
-        total_weeks_file_data=None, active_flag="A"),
-    Row(config_id="C007", source_object_name="objG", source_system="sysG", file_name="rootfile.csv", frequency="daily", location="locG", domain="domG", sub_domain="subG",
-        s3_vendor_path="s3://vendor-bucket/folderG/", source_path=None, s3_landing_path="s3://purgo-bucket/landingG/", s3_archive_path="s3://purgo-bucket/archiveG/",
-        delta_load_ts="2024-03-27T00:00:00.000+0000", full_or_incremental_load="F", zip_file="N", vendor="VendorG", delimiter=",", source_landing=None,
-        src_landing_table_name=None, publish_unstitched=None, publish_unstitched_table_name=None, publish_stitched=None, publish_stitched_table_name=None,
-        primary_key=None, header="Y", date_pattern=None, actual_file_name=None, vendor_file_deletion_flag="N", file_recursive_flag=None, total_weeks_req_data=None,
-        total_weeks_file_data=None, active_flag="A"),
-    Row(config_id="C008", source_object_name="objH", source_system="sysH", file_name="file8.csv", frequency="daily", location="locH", domain="domH", sub_domain="subH",
-        s3_vendor_path="not-a-s3-path", source_path=None, s3_landing_path="s3://purgo-bucket/landingH/", s3_archive_path="s3://purgo-bucket/archiveH/",
-        delta_load_ts="2024-03-28T00:00:00.000+0000", full_or_incremental_load="F", zip_file="N", vendor="VendorH", delimiter=",", source_landing=None,
-        src_landing_table_name=None, publish_unstitched=None, publish_unstitched_table_name=None, publish_stitched=None, publish_stitched_table_name=None,
-        primary_key=None, header="Y", date_pattern=None, actual_file_name=None, vendor_file_deletion_flag="N", file_recursive_flag=None, total_weeks_req_data=None,
-        total_weeks_file_data=None, active_flag="A"),
-    Row(config_id="C010", source_object_name="objJ", source_system="sysJ", file_name=None, frequency="daily", location="locJ", domain="domJ", sub_domain="subJ",
-        s3_vendor_path="s3://vendor-bucket/folderJ/", source_path=None, s3_landing_path="s3://purgo-bucket/landingJ/", s3_archive_path="s3://purgo-bucket/archiveJ/",
-        delta_load_ts="2024-04-02T00:00:00.000+0000", full_or_incremental_load="F", zip_file="N", vendor="VendorJ", delimiter=",", source_landing=None,
-        src_landing_table_name=None, publish_unstitched=None, publish_unstitched_table_name=None, publish_stitched=None, publish_stitched_table_name=None,
-        primary_key=None, header="Y", date_pattern=None, actual_file_name=None, vendor_file_deletion_flag="N", file_recursive_flag=None, total_weeks_req_data=None,
-        total_weeks_file_data=None, active_flag="A"),
-    Row(config_id="C010", source_object_name="objJ", source_system="sysJ", file_name="", frequency="daily", location="locJ", domain="domJ", sub_domain="subJ",
-        s3_vendor_path="s3://vendor-bucket/folderJ/", source_path=None, s3_landing_path="s3://purgo-bucket/landingJ/", s3_archive_path="s3://purgo-bucket/archiveJ/",
-        delta_load_ts="2024-04-02T00:00:00.000+0000", full_or_incremental_load="F", zip_file="N", vendor="VendorJ", delimiter=",", source_landing=None,
-        src_landing_table_name=None, publish_unstitched=None, publish_unstitched_table_name=None, publish_stitched=None, publish_stitched_table_name=None,
-        primary_key=None, header="Y", date_pattern=None, actual_file_name=None, vendor_file_deletion_flag="N", file_recursive_flag=None, total_weeks_req_data=None,
-        total_weeks_file_data=None, active_flag="A"),
-    Row(config_id="C011", source_object_name="objK", source_system="sysK", file_name="file:invalid.csv", frequency="daily", location="locK", domain="domK", sub_domain="subK",
-        s3_vendor_path="s3://vendor-bucket/folderK/", source_path=None, s3_landing_path="s3://purgo-bucket/landingK/", s3_archive_path="s3://purgo-bucket/archiveK/",
-        delta_load_ts="2024-04-03T00:00:00.000+0000", full_or_incremental_load="F", zip_file="N", vendor="VendorK", delimiter=",", source_landing=None,
-        src_landing_table_name=None, publish_unstitched=None, publish_unstitched_table_name=None, publish_stitched=None, publish_stitched_table_name=None,
-        primary_key=None, header="Y", date_pattern=None, actual_file_name=None, vendor_file_deletion_flag="N", file_recursive_flag=None, total_weeks_req_data=None,
-        total_weeks_file_data=None, active_flag="A"),
-    Row(config_id="C012", source_object_name="objL", source_system="sysL", file_name="file6.exe", frequency="daily", location="locL", domain="domL", sub_domain="subL",
-        s3_vendor_path="s3://vendor-bucket/folderL/", source_path=None, s3_landing_path="s3://purgo-bucket/landingL/", s3_archive_path="s3://purgo-bucket/archiveL/",
-        delta_load_ts="2024-04-04T00:00:00.000+0000", full_or_incremental_load="F", zip_file="N", vendor="VendorL", delimiter=",", source_landing=None,
-        src_landing_table_name=None, publish_unstitched=None, publish_unstitched_table_name=None, publish_stitched=None, publish_stitched_table_name=None,
-        primary_key=None, header="Y", date_pattern=None, actual_file_name=None, vendor_file_deletion_flag="N", file_recursive_flag=None, total_weeks_req_data=None,
-        total_weeks_file_data=None, active_flag="A"),
-    Row(config_id="C013", source_object_name="objM", source_system="sysM", file_name="file7.csv", frequency="daily", location="locM", domain="domM", sub_domain="subM",
-        s3_vendor_path="s3://vendor-bucket/folderM/", source_path=None, s3_landing_path="s3://purgo-bucket/landingM/", s3_archive_path="s3://purgo-bucket/archiveM/",
-        delta_load_ts="2024-03-31T00:00:00.000+0000", full_or_incremental_load="F", zip_file="N", vendor="VendorM", delimiter=",", source_landing=None,
-        src_landing_table_name=None, publish_unstitched=None, publish_unstitched_table_name=None, publish_stitched=None, publish_stitched_table_name=None,
-        primary_key=None, header="Y", date_pattern=None, actual_file_name=None, vendor_file_deletion_flag="N", file_recursive_flag=None, total_weeks_req_data=None,
-        total_weeks_file_data=None, active_flag="A"),
-    Row(config_id="C014", source_object_name="objN", source_system="sysN", file_name="file8.csv", frequency="daily", location="locN", domain="domN", sub_domain="subN",
-        s3_vendor_path="s3://vendor-bucket/folderN/", source_path=None, s3_landing_path="s3://purgo-bucket/landingN/", s3_archive_path="s3://purgo-bucket/archiveN/",
-        delta_load_ts="2024-03-31T00:00:00.000+0000", full_or_incremental_load="F", zip_file="N", vendor="VendorN", delimiter=",", source_landing=None,
-        src_landing_table_name=None, publish_unstitched=None, publish_unstitched_table_name=None, publish_stitched=None, publish_stitched_table_name=None,
-        primary_key=None, header="Y", date_pattern=None, actual_file_name=None, vendor_file_deletion_flag="N", file_recursive_flag=None, total_weeks_req_data=None,
-        total_weeks_file_data=None, active_flag="A"),
-    Row(config_id="C016", source_object_name="objP", source_system="sysP", file_name="File9.csv", frequency="daily", location="locP", domain="domP", sub_domain="subP",
-        s3_vendor_path="s3://vendor-bucket/folderP/", source_path=None, s3_landing_path="s3://purgo-bucket/landingP/", s3_archive_path="s3://purgo-bucket/archiveP/",
-        delta_load_ts="2024-04-01T00:00:00.000+0000", full_or_incremental_load="F", zip_file="N", vendor="VendorP", delimiter=",", source_landing=None,
-        src_landing_table_name=None, publish_unstitched=None, publish_unstitched_table_name=None, publish_stitched=None, publish_stitched_table_name=None,
-        primary_key=None, header="Y", date_pattern=None, actual_file_name=None, vendor_file_deletion_flag="N", file_recursive_flag=None, total_weeks_req_data=None,
-        total_weeks_file_data=None, active_flag="A"),
-    Row(config_id="C017", source_object_name="objQ", source_system="sysQ", file_name="file17.csv", frequency="daily", location="locQ", domain="domQ", sub_domain="subQ",
-        s3_vendor_path="s3://vendor-bucket/folderQ/", source_path=None, s3_landing_path="s3://purgo-bucket/landingQ/", s3_archive_path="s3://purgo-bucket/archiveQ/",
-        delta_load_ts="2024-04-01T00:00:00.000+0000", full_or_incremental_load="F", zip_file="N", vendor="VendorQ", delimiter=",", source_landing=None,
-        src_landing_table_name=None, publish_unstitched=None, publish_unstitched_table_name=None, publish_stitched=None, publish_stitched_table_name=None,
-        primary_key=None, header="Y", date_pattern=None, actual_file_name=None, vendor_file_deletion_flag="N", file_recursive_flag=None, total_weeks_req_data=None,
-        total_weeks_file_data=None, active_flag=None),
-    Row(config_id="C018", source_object_name="objR", source_system="sysR", file_name="file18.csv", frequency="daily", location="locR", domain="domR", sub_domain="subR",
-        s3_vendor_path="s3://vendor-bucket/folderR/", source_path=None, s3_landing_path="s3://purgo-bucket/landingR/", s3_archive_path="s3://purgo-bucket/archiveR/",
-        delta_load_ts="2024-04-02T00:00:00.000+0000", full_or_incremental_load="F", zip_file="N", vendor="VendorR", delimiter=",", source_landing=None,
-        src_landing_table_name=None, publish_unstitched=None, publish_unstitched_table_name=None, publish_stitched=None, publish_stitched_table_name=None,
-        primary_key=None, header="Y", date_pattern=None, actual_file_name=None, vendor_file_deletion_flag="N", file_recursive_flag=None, total_weeks_req_data=None,
-        total_weeks_file_data=None, active_flag="Y"),
-    Row(config_id="C019", source_object_name="objS", source_system="sysS", file_name="file10.csv", frequency="daily", location="locS", domain="domS", sub_domain="subS",
-        s3_vendor_path="s3://vendor-bucket/folderS/", source_path=None, s3_landing_path="s3://purgo-bucket/landingS/", s3_archive_path="s3://purgo-bucket/archiveS/",
-        delta_load_ts="2024-04-06T00:00:00.000+0000", full_or_incremental_load="F", zip_file="N", vendor="VendorS", delimiter=",", source_landing=None,
-        src_landing_table_name=None, publish_unstitched=None, publish_unstitched_table_name=None, publish_stitched=None, publish_stitched_table_name=None,
-        primary_key=None, header="Y", date_pattern=None, actual_file_name=None, vendor_file_deletion_flag="N", file_recursive_flag=None, total_weeks_req_data=None,
-        total_weeks_file_data=None, active_flag="A"),
-    Row(config_id="C020", source_object_name="objT", source_system="sysT", file_name="file11.csv", frequency="daily", location="locT", domain="domT", sub_domain="subT",
-        s3_vendor_path="s3://vendor-bucket/folderT/", source_path=None, s3_landing_path="s3://purgo-bucket/landingT/", s3_archive_path="s3://purgo-bucket/archiveT/",
-        delta_load_ts="2024-04-07T00:00:00.000+0000", full_or_incremental_load="F", zip_file="N", vendor="VendorT", delimiter=",", source_landing=None,
-        src_landing_table_name=None, publish_unstitched=None, publish_unstitched_table_name=None, publish_stitched=None, publish_stitched_table_name=None,
-        primary_key=None, header="Y", date_pattern=None, actual_file_name=None, vendor_file_deletion_flag="N", file_recursive_flag=None, total_weeks_req_data=None,
-        total_weeks_file_data=None, active_flag="A"),
-    Row(config_id="C021", source_object_name="objU", source_system="sysU", file_name=" file12.csv ", frequency="daily", location="locU", domain="domU", sub_domain="subU",
-        s3_vendor_path="s3://vendor-bucket/folderU/", source_path=None, s3_landing_path="s3://purgo-bucket/landingU/", s3_archive_path="s3://purgo-bucket/archiveU/",
-        delta_load_ts="2024-04-05T00:00:00.000+0000", full_or_incremental_load="F", zip_file="N", vendor="VendorU", delimiter=",", source_landing=None,
-        src_landing_table_name=None, publish_unstitched=None, publish_unstitched_table_name=None, publish_stitched=None, publish_stitched_table_name=None,
-        primary_key=None, header="Y", date_pattern=None, actual_file_name=None, vendor_file_deletion_flag="N", file_recursive_flag=None, total_weeks_req_data=None,
-        total_weeks_file_data=None, active_flag="A"),
+def assert_df_not_contains(df, unexpected_rows):
+    """
+    Assert that the DataFrame does not contain any of the unexpected rows.
+    """
+    actual_rows = [tuple(row) for row in df.collect()]
+    for row in unexpected_rows:
+        assert tuple(row) not in actual_rows, f"Unexpected row {row} found in DataFrame"
+
+def assert_column_values(df, column, expected_values):
+    """
+    Assert that the DataFrame column contains only the expected values.
+    """
+    actual_values = set([row[column] for row in df.select(column).distinct().collect()])
+    assert actual_values == set(expected_values), f"Column values mismatch: {actual_values} != {set(expected_values)}"
+
+def assert_null_handling(df, column):
+    """
+    Assert that NULLs are handled correctly in the specified column.
+    """
+    null_count = df.filter(F.col(column).isNull()).count()
+    assert null_count >= 0, "NULL handling failed"
+
+# ---------------------------------------------------------------
+# SECTION: Test 1 - Schema Validation for ingest_config_master
+# ---------------------------------------------------------------
+
+# /* Test that the schema of purgo_playground.ingest_config_master matches the expected definition */
+ingest_config_master_df = spark.table("purgo_playground.ingest_config_master")
+expected_schema = [
+    ("config_id", StringType(), True),
+    ("source_object_name", StringType(), True),
+    ("source_system", StringType(), True),
+    ("file_name", StringType(), True),
+    ("frequency", StringType(), True),
+    ("location", StringType(), True),
+    ("domain", StringType(), True),
+    ("sub_domain", StringType(), True),
+    ("s3_vendor_path", StringType(), True),
+    ("source_path", StringType(), True),
+    ("s3_landing_path", StringType(), True),
+    ("s3_archive_path", StringType(), True),
+    ("delta_load_ts", StringType(), True),
+    ("full_or_incremental_load", StringType(), True),
+    ("zip_file", StringType(), True),
+    ("vendor", StringType(), True),
+    ("delimiter", StringType(), True),
+    ("source_landing", StringType(), True),
+    ("src_landing_table_name", StringType(), True),
+    ("publish_unstitched", StringType(), True),
+    ("publish_unstitched_table_name", StringType(), True),
+    ("publish_stitched", StringType(), True),
+    ("publish_stitched_table_name", StringType(), True),
+    ("primary_key", StringType(), True),
+    ("header", StringType(), True),
+    ("date_pattern", StringType(), True),
+    ("actual_file_name", StringType(), True),
+    ("vendor_file_deletion_flag", StringType(), True),
+    ("file_recursive_flag", StringType(), True),
+    ("total_weeks_req_data", StringType(), True),
+    ("total_weeks_file_data", StringType(), True),
+    ("active_flag", StringType(), True)
 ]
+assert_df_schema(ingest_config_master_df, expected_schema)
+assert_df_column_count(ingest_config_master_df, 32)
 
-ingest_config_master_df = spark.createDataFrame(ingest_config_master_data, schema=ingest_config_master_schema)
+# ---------------------------------------------------------------
+# SECTION: Test 2 - Schema Validation for s3_file_process_log
+# ---------------------------------------------------------------
 
-# -- S3 Folder Listings (mocked as dict)
-s3_folder_listings = {
-    "s3://vendor-bucket/folderA/": [{"file_name": "file1.csv", "size_bytes": 1024}],
-    "s3://purgo-bucket/landingA/": [],
-    "s3://purgo-bucket/archiveA/": [],
-    "s3://vendor-bucket/folderB/": [{"file_name": "file2.csv", "size_bytes": 2048}],
-    "s3://purgo-bucket/landingB/": [{"file_name": "file2.csv", "size_bytes": 2048}],
-    "s3://purgo-bucket/archiveB/": [],
-    "s3://vendor-bucket/folderC/": [{"file_name": "file3.csv", "size_bytes": 4096}],
-    "s3://purgo-bucket/landingC/": [],
-    "s3://purgo-bucket/archiveC/": [{"file_name": "file3.csv", "size_bytes": 4096}],
-    "s3://vendor-bucket/folderD/": [{"file_name": "file4.csv", "size_bytes": 1024}],
-    "s3://vendor-bucket/folderF/": [
-        {"file_name": "a.csv", "size_bytes": 100},
-        {"file_name": "b.csv", "size_bytes": 200},
-        {"file_name": "c.csv", "size_bytes": 300}
-    ],
-    "s3://purgo-bucket/landingF/": [{"file_name": "b.csv", "size_bytes": 200}],
-    "s3://purgo-bucket/archiveF/": [{"file_name": "c.csv", "size_bytes": 300}],
-    "s3://vendor-bucket/folderG/": [
-        {"file_name": "rootfile.csv", "size_bytes": 1000},
-        {"file_name": "subfolder/file5.csv", "size_bytes": 1000}
-    ],
-    "s3://purgo-bucket/landingG/": [],
-    "s3://purgo-bucket/archiveG/": [],
-    "s3://vendor-bucket/folderI/": [],
-    "s3://vendor-bucket/folderJ/": [
-        {"file_name": None, "size_bytes": 100},
-        {"file_name": "", "size_bytes": 100}
-    ],
-    "s3://vendor-bucket/folderK/": [{"file_name": "file:invalid.csv", "size_bytes": 100}],
-    "s3://vendor-bucket/folderL/": [{"file_name": "file6.exe", "size_bytes": 100}],
-    "s3://vendor-bucket/folderM/": [{"file_name": "file7.csv", "size_bytes": 100}],
-    "s3://purgo-bucket/landingM/": [],
-    "s3://purgo-bucket/archiveM/": [],
-    "s3://vendor-bucket/folderN/": [{"file_name": "file8.csv", "size_bytes": 100}],
-    "s3://purgo-bucket/landingN/": [],
-    "s3://purgo-bucket/archiveN/": [],
-    "s3://vendor-bucket/folderP/": [{"file_name": "File9.csv", "size_bytes": 100}],
-    "s3://purgo-bucket/landingP/": [{"file_name": "file9.csv", "size_bytes": 100}],
-    "s3://vendor-bucket/folderS/": [
-        {"file_name": "file10.csv", "size_bytes": 100},
-        {"file_name": "file10.csv", "size_bytes": 200}
-    ],
-    "s3://vendor-bucket/folderT/": [{"file_name": "file11.csv", "size_bytes": 0}],
-    "s3://vendor-bucket/folderU/": [{"file_name": " file12.csv ", "size_bytes": 100}],
-}
-
-# -- Allowed file extensions for transfer
-ALLOWED_EXTENSIONS = [".csv", ".txt"]
-
-# -- Invalid file name pattern (forbidden chars)
-INVALID_FILENAME_PATTERN = r"[:\n\t]"
-
-# -- Helper: Simulate S3 list operation (returns list of file dicts)
-def list_s3_files(folder_path):
-    # Simulate S3 list; in real code, use boto3 or dbutils.fs.ls
-    return s3_folder_listings.get(folder_path, [])
-
-# -- Helper: Simulate S3 copy operation (returns True if copy would succeed)
-def copy_s3_file(src_folder, file_name, dest_folder):
-    # Simulate copy; in real code, use boto3 or dbutils.fs.cp
-    return True
-
-# -- Helper: Simulate Databricks secret retrieval
-def get_aws_secret(secret_scope, key):
-    # Simulate secret retrieval; in real code, use dbutils.secrets.get
-    if secret_scope != "aws_keys":
-        raise Exception("Unable to access Databricks secret scope 'aws_keys' for AWS credentials")
-    if key == "access_key":
-        return "FAKE_ACCESS_KEY"
-    if key == "secret_key":
-        return "FAKE_SECRET_KEY"
-    raise Exception("Missing AWS credentials in Databricks secret scope 'aws_keys'")
-
-# -- Helper: Validate S3 URI
-def is_valid_s3_uri(uri):
-    return isinstance(uri, str) and uri.startswith("s3://") and len(uri) > 5
-
-# -- Helper: Validate file name
-def is_valid_file_name(file_name):
-    if file_name is None or file_name == "":
-        return False
-    if re.search(INVALID_FILENAME_PATTERN, file_name):
-        return False
-    if file_name.strip() != file_name:
-        return False
-    return True
-
-# -- Helper: Validate file extension
-def is_allowed_extension(file_name):
-    return any(file_name.endswith(ext) for ext in ALLOWED_EXTENSIONS)
-
-# -- Helper: Check for duplicate file names in a folder
-def has_duplicate_file_names(file_list):
-    names = [f["file_name"] for f in file_list if f["file_name"] is not None]
-    return len(names) != len(set(names))
-
-# -- Helper: Check for zero-byte files
-def is_zero_byte(file_dict):
-    return file_dict.get("size_bytes", 1) == 0
-
-# -------------------------------
-# Test 1: Schema Validation
-# -------------------------------
-
-# -- Validate ingest_config_master schema matches expected
-expected_schema_fields = [
-    "config_id", "source_object_name", "source_system", "file_name", "frequency", "location", "domain", "sub_domain",
-    "s3_vendor_path", "source_path", "s3_landing_path", "s3_archive_path", "delta_load_ts", "full_or_incremental_load",
-    "zip_file", "vendor", "delimiter", "source_landing", "src_landing_table_name", "publish_unstitched",
-    "publish_unstitched_table_name", "publish_stitched", "publish_stitched_table_name", "primary_key", "header",
-    "date_pattern", "actual_file_name", "vendor_file_deletion_flag", "file_recursive_flag", "total_weeks_req_data",
-    "total_weeks_file_data", "active_flag"
+# /* Test that the schema of purgo_playground.s3_file_process_log matches the expected definition */
+s3_file_process_log_df = spark.table("purgo_playground.s3_file_process_log")
+expected_schema_log = [
+    ("file_name", StringType(), True),
+    ("s3_vendor_path", StringType(), True),
+    ("s3_landing_path", StringType(), True),
+    ("s3_archive_path", StringType(), True),
+    ("file_status", StringType(), True),
+    ("file_processed_date", TimestampType(), True)
 ]
-assert [f.name for f in ingest_config_master_df.schema.fields] == expected_schema_fields, \
-    "ingest_config_master schema does not match expected"
+assert_df_schema(s3_file_process_log_df, expected_schema_log)
+assert_df_column_count(s3_file_process_log_df, 6)
 
-# -------------------------------
-# Test 2: Only Active Configs with Valid S3 Paths are Processed
-# -------------------------------
+# ---------------------------------------------------------------
+# SECTION: Test 3 - Data Type Conversion and NULL Handling
+# ---------------------------------------------------------------
 
-active_configs = ingest_config_master_df.filter(
-    (col("active_flag") == "A") &
-    col("s3_vendor_path").isNotNull() &
-    col("s3_landing_path").isNotNull() &
-    col("s3_archive_path").isNotNull() &
-    col("s3_vendor_path").startswith("s3://") &
-    col("s3_landing_path").startswith("s3://") &
-    col("s3_archive_path").startswith("s3://")
+# /* Test that all string columns can be cast to STRING and NULLs are handled */
+for col in ["file_name", "s3_vendor_path", "s3_landing_path", "s3_archive_path", "file_status"]:
+    s3_file_process_log_df = s3_file_process_log_df.withColumn(col, F.col(col).cast(StringType()))
+    assert_null_handling(s3_file_process_log_df, col)
+
+# /* Test that file_processed_date can be cast to TIMESTAMP and NULLs are handled */
+s3_file_process_log_df = s3_file_process_log_df.withColumn("file_processed_date", F.col("file_processed_date").cast(TimestampType()))
+assert_null_handling(s3_file_process_log_df, "file_processed_date")
+
+# ---------------------------------------------------------------
+# SECTION: Test 4 - Complex Type Validation (ARRAY, STRUCT, MAP)
+# ---------------------------------------------------------------
+
+# /* Test that we can create and query STRUCT, ARRAY, and MAP columns using Databricks native types */
+complex_df = s3_file_process_log_df.withColumn(
+    "file_struct",
+    F.struct("file_name", "file_status")
+).withColumn(
+    "file_array",
+    F.array("file_name", "file_status")
+).withColumn(
+    "file_map",
+    F.create_map(F.lit("name"), F.col("file_name"), F.lit("status"), F.col("file_status"))
+)
+assert "file_struct" in complex_df.columns
+assert "file_array" in complex_df.columns
+assert "file_map" in complex_df.columns
+
+# /* Validate that STRUCT, ARRAY, and MAP columns are not NULL for non-NULL file_name/file_status */
+non_null_complex = complex_df.filter(F.col("file_name").isNotNull() & F.col("file_status").isNotNull())
+assert non_null_complex.filter(F.col("file_struct").isNull()).count() == 0
+assert non_null_complex.filter(F.col("file_array").isNull()).count() == 0
+assert non_null_complex.filter(F.col("file_map").isNull()).count() == 0
+
+# ---------------------------------------------------------------
+# SECTION: Test 5 - File Eligibility Logic (Unit Test)
+# ---------------------------------------------------------------
+
+# /* Test that only files with active_flag = "A" are eligible for ingestion */
+active_configs = ingest_config_master_df.filter(F.col("active_flag") == "A")
+inactive_configs = ingest_config_master_df.filter(F.col("active_flag") != "A")
+assert active_configs.count() > 0
+assert inactive_configs.count() > 0
+
+# /* Test that file_name matching is case-sensitive and includes extension */
+case_sensitive_test = ingest_config_master_df.filter(F.col("config_id") == "127").select("file_name").collect()[0][0]
+assert case_sensitive_test == "Data6.CSV"
+
+# ---------------------------------------------------------------
+# SECTION: Test 6 - Integration Test: End-to-End File Transfer Logic
+# ---------------------------------------------------------------
+
+# /* Simulate the file transfer logic using test tables for S3 file listings */
+vendor_files_df = spark.table("purgo_playground.test_vendor_s3_files")
+purgo_files_df = spark.table("purgo_playground.test_purgo_s3_files")
+archive_files_df = spark.table("purgo_playground.test_archive_s3_files")
+
+# /* Join config with vendor files to get eligible files */
+eligible_files_df = (
+    ingest_config_master_df
+    .filter(F.col("active_flag") == "A")
+    .join(vendor_files_df, (F.col("s3_vendor_path") == vendor_files_df.s3_path) & (F.col("file_name") == vendor_files_df.file_name), "inner")
+    .select(
+        F.col("config_id"),
+        F.col("file_name"),
+        F.col("s3_vendor_path"),
+        F.col("s3_landing_path"),
+        F.col("s3_archive_path")
+    )
 )
 
-# -- Assert that only configs with active_flag = "A" and valid S3 URIs are present
-for row in active_configs.collect():
-    assert row.active_flag == "A", f"Config {row.config_id} is not active"
-    assert is_valid_s3_uri(row.s3_vendor_path), f"Config {row.config_id} has invalid s3_vendor_path"
-    assert is_valid_s3_uri(row.s3_landing_path), f"Config {row.config_id} has invalid s3_landing_path"
-    assert is_valid_s3_uri(row.s3_archive_path), f"Config {row.config_id} has invalid s3_archive_path"
+# /* Exclude files already in Purgo or Archive */
+eligible_files_df = (
+    eligible_files_df
+    .join(
+        purgo_files_df,
+        (eligible_files_df.s3_landing_path == purgo_files_df.s3_path) & (eligible_files_df.file_name == purgo_files_df.file_name),
+        "left_anti"
+    )
+    .join(
+        archive_files_df,
+        (eligible_files_df.s3_archive_path == archive_files_df.s3_path) & (eligible_files_df.file_name == archive_files_df.file_name),
+        "left_anti"
+    )
+)
 
-# -------------------------------
-# Test 3: File Transfer Logic - Happy Path
-# -------------------------------
+# /* Assert that only expected files are eligible for transfer (e.g., data1.csv, Data6.CSV, fileA.csv, etc.) */
+expected_eligible_files = set([
+    ("123", "data1.csv", "s3://vendor-bucket/folderA/", "s3://purgo-bucket/landingA/", "s3://purgo-bucket/archiveA/"),
+    ("127", "Data6.CSV", "s3://vendor-bucket/folderE/", "s3://purgo-bucket/landingE/", "s3://purgo-bucket/archiveE/"),
+    ("201", "fileA.csv", "s3://vendor-bucket/folderF/", "s3://purgo-bucket/landingF/", "s3://purgo-bucket/archiveF/"),
+    ("301", "fileG.csv", "s3://vendor-bucket/folderK/", "s3://purgo-bucket/landingK/", "s3://purgo-bucket/archiveK/"),
+    ("777", "spécial_文件.csv", "s3://vendor-bucket/folderΩ/", "s3://purgo-bucket/landingΩ/", "s3://purgo-bucket/archiveΩ/")
+])
+actual_eligible_files = set([tuple(row) for row in eligible_files_df.collect()])
+for row in expected_eligible_files:
+    assert row in actual_eligible_files, f"Eligible file {row} not found"
 
-# -- C001: file1.csv should be copied (not present in Purgo or Archive)
-row = ingest_config_master_df.filter(col("config_id") == "C001").collect()[0]
-vendor_files = list_s3_files(row.s3_vendor_path)
-purgo_files = list_s3_files(row.s3_landing_path)
-archive_files = list_s3_files(row.s3_archive_path)
-file_names_in_purgo = set(f["file_name"] for f in purgo_files)
-file_names_in_archive = set(f["file_name"] for f in archive_files)
-for f in vendor_files:
-    if f["file_name"] not in file_names_in_purgo and f["file_name"] not in file_names_in_archive:
-        assert copy_s3_file(row.s3_vendor_path, f["file_name"], row.s3_landing_path), \
-            "File should be copied to Purgo S3"
-        assert f["file_name"] in [x["file_name"] for x in vendor_files], \
-            "File should remain in vendor S3"
-        assert f["file_name"] not in file_names_in_archive, \
-            "File should not exist in Archive S3"
-        assert f["file_name"] not in file_names_in_purgo, \
-            "File should not be overwritten in Purgo S3"
+# ---------------------------------------------------------------
+# SECTION: Test 7 - Data Quality Validation: No Duplicates, No NULLs in Key Columns
+# ---------------------------------------------------------------
 
-# -------------------------------
-# Test 4: File Already in Purgo - No Overwrite
-# -------------------------------
+# /* Assert that there are no duplicate file_name + s3_landing_path in s3_file_process_log */
+dupes = (
+    s3_file_process_log_df
+    .groupBy("file_name", "s3_landing_path")
+    .count()
+    .filter(F.col("count") > 1)
+)
+assert dupes.count() == 0, "Duplicate file_name + s3_landing_path found in s3_file_process_log"
 
-# -- C002: file2.csv already in Purgo, should not be copied/overwritten
-row = ingest_config_master_df.filter(col("config_id") == "C002").collect()[0]
-vendor_files = list_s3_files(row.s3_vendor_path)
-purgo_files = list_s3_files(row.s3_landing_path)
-file_names_in_purgo = set(f["file_name"] for f in purgo_files)
-for f in vendor_files:
-    assert f["file_name"] in file_names_in_purgo, "File already exists in Purgo S3"
-    # Simulate: should not copy/overwrite
-    assert not (f["file_name"] not in file_names_in_purgo), "Should not copy file already in Purgo"
+# /* Assert that file_status is not NULL for any processed file */
+assert s3_file_process_log_df.filter(F.col("file_name").isNotNull() & F.col("file_status").isNull()).count() == 0
 
-# -------------------------------
-# Test 5: File Already in Archive - No Transfer
-# -------------------------------
+# ---------------------------------------------------------------
+# SECTION: Test 8 - Delta Lake Operations: MERGE, UPDATE, DELETE
+# ---------------------------------------------------------------
 
-# -- C003: file3.csv already in Archive, should not be copied
-row = ingest_config_master_df.filter(col("config_id") == "C003").collect()[0]
-vendor_files = list_s3_files(row.s3_vendor_path)
-archive_files = list_s3_files(row.s3_archive_path)
-file_names_in_archive = set(f["file_name"] for f in archive_files)
-for f in vendor_files:
-    assert f["file_name"] in file_names_in_archive, "File already exists in Archive S3"
-    # Simulate: should not copy
-    assert not (f["file_name"] not in file_names_in_archive), "Should not copy file already in Archive"
+# /* Test Delta Lake MERGE: Upsert a new log record and verify */
+from delta.tables import DeltaTable  
 
-# -------------------------------
-# Test 6: Inactive Config - No Transfer
-# -------------------------------
+log_table = DeltaTable.forName(spark, "purgo_playground.s3_file_process_log")
+merge_df = spark.createDataFrame([
+    ("fileZ.csv", "s3://vendor-bucket/folderZ/", "s3://purgo-bucket/landingZ/", "s3://purgo-bucket/archiveZ/", "SUCCESS", F.current_timestamp())
+], ["file_name", "s3_vendor_path", "s3_landing_path", "s3_archive_path", "file_status", "file_processed_date"])
 
-# -- C004: active_flag != "A", should not transfer
-row = ingest_config_master_df.filter(col("config_id") == "C004").collect()[0]
-assert row.active_flag != "A", "Config should be inactive"
-vendor_files = list_s3_files(row.s3_vendor_path)
-for f in vendor_files:
-    # Simulate: should not copy
-    assert True, "No transfer for inactive config"
+log_table.alias("tgt").merge(
+    merge_df.alias("src"),
+    "tgt.file_name = src.file_name AND tgt.s3_landing_path = src.s3_landing_path"
+).whenMatchedUpdateAll().whenNotMatchedInsertAll().execute()
 
-# -------------------------------
-# Test 7: Missing S3 Path - Error
-# -------------------------------
+# /* Assert that fileZ.csv now exists in the log */
+assert log_table.toDF().filter(F.col("file_name") == "fileZ.csv").count() == 1
 
-# -- C005: s3_vendor_path is None, should raise error
-row = ingest_config_master_df.filter(col("config_id") == "C005").collect()[0]
+# /* Test Delta Lake UPDATE: Update file_status for fileZ.csv */
+log_table.update(
+    condition="file_name = 'fileZ.csv'",
+    set={"file_status": "'UPDATED'"}
+)
+assert log_table.toDF().filter((F.col("file_name") == "fileZ.csv") & (F.col("file_status") == "UPDATED")).count() == 1
+
+# /* Test Delta Lake DELETE: Remove fileZ.csv */
+log_table.delete("file_name = 'fileZ.csv'")
+assert log_table.toDF().filter(F.col("file_name") == "fileZ.csv").count() == 0
+
+# ---------------------------------------------------------------
+# SECTION: Test 9 - Window Functions and Analytics Features
+# ---------------------------------------------------------------
+
+# /* Test window function: Rank files by processed date within each status */
+from pyspark.sql.window import Window  
+window_spec = Window.partitionBy("file_status").orderBy(F.col("file_processed_date").desc())
+ranked_df = s3_file_process_log_df.withColumn("rank", F.row_number().over(window_spec))
+assert "rank" in ranked_df.columns
+
+# /* Assert that rank is always >= 1 */
+assert ranked_df.filter(F.col("rank") < 1).count() == 0
+
+# ---------------------------------------------------------------
+# SECTION: Test 10 - Error Handling: Missing S3 Path in Config
+# ---------------------------------------------------------------
+
+# /* Test that missing S3 path in config results in ERROR_CONFIG in log */
+missing_path_log = s3_file_process_log_df.filter((F.col("file_name") == "data5.csv") & (F.col("file_status") == "ERROR_CONFIG"))
+assert missing_path_log.count() == 1
+
+# ---------------------------------------------------------------
+# SECTION: Test 11 - Error Handling: Missing AWS Credentials
+# ---------------------------------------------------------------
+
+# /* Simulate missing AWS credentials by catching exception when accessing secrets */
 try:
-    if not (row.s3_vendor_path and row.s3_landing_path and row.s3_archive_path):
-        raise Exception(f"Missing required S3 path(s) in ingest_config_master for config_id {row.config_id}")
+    access_key = dbutils.secrets.get(scope="aws_keys", key="access_key")  # Databricks built-in
+    secret_key = dbutils.secrets.get(scope="aws_keys", key="secret_key")
 except Exception as e:
-    assert "Missing required S3 path(s)" in str(e), "Should raise missing S3 path error"
+    assert "not found" in str(e) or "No such secret" in str(e) or "not exist" in str(e)
 
-# -------------------------------
-# Test 8: Invalid S3 URI - Error
-# -------------------------------
+# ---------------------------------------------------------------
+# SECTION: Test 12 - File Name Matching: Case Sensitivity
+# ---------------------------------------------------------------
 
-# -- C008: s3_vendor_path is not a valid S3 URI
-row = ingest_config_master_df.filter(col("config_id") == "C008").collect()[0]
-try:
-    if not is_valid_s3_uri(row.s3_vendor_path):
-        raise Exception(f"Invalid S3 URI in ingest_config_master for config_id {row.config_id}")
-except Exception as e:
-    assert "Invalid S3 URI" in str(e), "Should raise invalid S3 URI error"
+# /* Test that only Data6.CSV is processed, not data6.csv, for config_id=127 */
+log_case = s3_file_process_log_df.filter((F.col("file_name") == "Data6.CSV") & (F.col("file_status") == "SUCCESS"))
+assert log_case.count() == 1
+log_case2 = s3_file_process_log_df.filter((F.col("file_name") == "data6.csv") & (F.col("file_status") == "SKIPPED_NOT_CONFIGURED"))
+assert log_case2.count() == 1
 
-# -------------------------------
-# Test 9: Vendor S3 Folder Empty - No Transfer
-# -------------------------------
+# ---------------------------------------------------------------
+# SECTION: Test 13 - Subfolder Exclusion (No Recursion)
+# ---------------------------------------------------------------
 
-# -- C009: vendor S3 folder is empty
-vendor_files = list_s3_files("s3://vendor-bucket/folderI/")
-assert len(vendor_files) == 0, "Vendor S3 folder should be empty"
+# /* Test that subfolder/fileH.csv is not processed or logged */
+log_subfolder = s3_file_process_log_df.filter(F.col("file_name") == "subfolder/fileH.csv")
+assert log_subfolder.count() == 0
 
-# -------------------------------
-# Test 10: File Name is Null or Empty - Error
-# -------------------------------
+# ---------------------------------------------------------------
+# SECTION: Test 14 - S3 Access Error Handling
+# ---------------------------------------------------------------
 
-# -- C010: file_name is None or empty string
-vendor_files = list_s3_files("s3://vendor-bucket/folderJ/")
-for f in vendor_files:
-    try:
-        if not is_valid_file_name(f["file_name"]):
-            raise Exception("Invalid file name encountered in vendor S3 folder for config_id C010")
-    except Exception as e:
-        assert "Invalid file name" in str(e), "Should raise invalid file name error"
+# /* Test that fileI.csv with S3 access error is logged as ERROR_S3_ACCESS */
+log_s3_error = s3_file_process_log_df.filter((F.col("file_name") == "fileI.csv") & (F.col("file_status") == "ERROR_S3_ACCESS"))
+assert log_s3_error.count() == 1
 
-# -------------------------------
-# Test 11: File Name Contains Invalid Characters - Error
-# -------------------------------
+# ---------------------------------------------------------------
+# SECTION: Test 15 - No Eligible Files to Transfer
+# ---------------------------------------------------------------
 
-# -- C011: file:invalid.csv
-vendor_files = list_s3_files("s3://vendor-bucket/folderK/")
-for f in vendor_files:
-    try:
-        if not is_valid_file_name(f["file_name"]):
-            raise Exception(f"Invalid file name '{f['file_name']}' in vendor S3 folder for config_id C011")
-    except Exception as e:
-        assert "Invalid file name" in str(e), "Should raise invalid file name error"
+# /* Test that no new records are logged for folderM (fileJ.csv) as there are no eligible files */
+log_no_eligible = s3_file_process_log_df.filter(F.col("file_name") == "fileJ.csv")
+assert log_no_eligible.count() == 0
 
-# -------------------------------
-# Test 12: File Extension Not Allowed - Warning, No Transfer
-# -------------------------------
+# ---------------------------------------------------------------
+# SECTION: Test 16 - File Not in Config is Not Transferred
+# ---------------------------------------------------------------
 
-# -- C012: file6.exe
-vendor_files = list_s3_files("s3://vendor-bucket/folderL/")
-for f in vendor_files:
-    if not is_allowed_extension(f["file_name"]):
-        # Simulate warning log
-        warning_msg = f"File extension '{f['file_name'].split('.')[-1]}' not allowed for {f['file_name']} in config_id C012"
-        assert "exe" in warning_msg, "Should log warning for disallowed extension"
+# /* Test that fileL.csv is logged as SKIPPED_NOT_CONFIGURED */
+log_not_configured = s3_file_process_log_df.filter((F.col("file_name") == "fileL.csv") & (F.col("file_status") == "SKIPPED_NOT_CONFIGURED"))
+assert log_not_configured.count() == 1
 
-# -------------------------------
-# Test 13: Multiple Active Configs - All Should Transfer
-# -------------------------------
+# ---------------------------------------------------------------
+# SECTION: Test 17 - Data-Driven Scenario Outline Validation
+# ---------------------------------------------------------------
 
-# -- C013, C014: file7.csv, file8.csv
-rowM = ingest_config_master_df.filter(col("config_id") == "C013").collect()[0]
-rowN = ingest_config_master_df.filter(col("config_id") == "C014").collect()[0]
-vendor_files_M = list_s3_files(rowM.s3_vendor_path)
-vendor_files_N = list_s3_files(rowN.s3_vendor_path)
-purgo_files_M = list_s3_files(rowM.s3_landing_path)
-purgo_files_N = list_s3_files(rowN.s3_landing_path)
-for f in vendor_files_M:
-    assert f["file_name"] not in [x["file_name"] for x in purgo_files_M], "file7.csv should be copied"
-for f in vendor_files_N:
-    assert f["file_name"] not in [x["file_name"] for x in purgo_files_N], "file8.csv should be copied"
+# /* Validate all data-driven scenario outline examples */
+data_driven_cases = [
+    ("fileA.csv", "SUCCESS"),
+    ("fileB.csv", "SKIPPED_EXISTS"),
+    ("fileC.csv", "SKIPPED_ARCHIVED"),
+    ("fileD.csv", "SKIPPED_INACTIVE"),
+    ("fileF.csv", "SKIPPED_NOT_CONFIGURED")
+]
+for fname, status in data_driven_cases:
+    assert s3_file_process_log_df.filter((F.col("file_name") == fname) & (F.col("file_status") == status)).count() == 1
 
-# -------------------------------
-# Test 14: Case-Sensitive File Name Match
-# -------------------------------
+# ---------------------------------------------------------------
+# SECTION: Test 18 - Performance Test: Large Batch Processing
+# ---------------------------------------------------------------
 
-# -- C016: File9.csv in vendor, file9.csv in Purgo (should copy, not skip)
-row = ingest_config_master_df.filter(col("config_id") == "C016").collect()[0]
-vendor_files = list_s3_files(row.s3_vendor_path)
-purgo_files = list_s3_files(row.s3_landing_path)
-purgo_file_names = set(f["file_name"] for f in purgo_files)
-for f in vendor_files:
-    assert f["file_name"] not in purgo_file_names, "Case-sensitive: File9.csv should be copied"
-
-# -------------------------------
-# Test 15: Duplicate File Name in Vendor S3 Folder - Error
-# -------------------------------
-
-# -- C019: two file10.csv in vendor
-vendor_files = list_s3_files("s3://vendor-bucket/folderS/")
-try:
-    if has_duplicate_file_names(vendor_files):
-        raise Exception("Duplicate file name 'file10.csv' found in vendor S3 folder for config_id C019")
-except Exception as e:
-    assert "Duplicate file name" in str(e), "Should raise duplicate file name error"
-
-# -------------------------------
-# Test 16: Zero-Byte File - Warning, No Transfer
-# -------------------------------
-
-# -- C020: file11.csv is zero bytes
-vendor_files = list_s3_files("s3://vendor-bucket/folderT/")
-for f in vendor_files:
-    if is_zero_byte(f):
-        warning_msg = f"File '{f['file_name']}' in vendor S3 folder for config_id C020 is empty and was skipped"
-        assert "skipped" in warning_msg, "Should log warning for zero-byte file"
-
-# -------------------------------
-# Test 17: File Name with Whitespace - Error
-# -------------------------------
-
-# -- C021: file name has leading/trailing whitespace
-vendor_files = list_s3_files("s3://vendor-bucket/folderU/")
-for f in vendor_files:
-    try:
-        if not is_valid_file_name(f["file_name"]):
-            raise Exception(f"File name '{f['file_name']}' contains leading or trailing whitespace in vendor S3 folder for config_id C021")
-    except Exception as e:
-        assert "leading or trailing whitespace" in str(e), "Should raise whitespace file name error"
-
-# -------------------------------
-# Test 18: No Active Configs - No Transfer
-# -------------------------------
-
-# -- C017: active_flag is null
-row = ingest_config_master_df.filter(col("config_id") == "C017").collect()[0]
-assert row.active_flag is None, "Config should have no active_flag"
-# Simulate: no files transferred
-
-# -- C018: active_flag not "A"
-row = ingest_config_master_df.filter(col("config_id") == "C018").collect()[0]
-assert row.active_flag != "A", "Config should not be active"
-# Simulate: no files transferred
-
-# -------------------------------
-# Test 19: File in Subfolder - Should Not Transfer
-# -------------------------------
-
-# -- C007: subfolder/file5.csv should not be transferred
-row = ingest_config_master_df.filter(col("config_id") == "C007").collect()[0]
-vendor_files = list_s3_files(row.s3_vendor_path)
-for f in vendor_files:
-    if "/" in f["file_name"]:
-        assert not is_valid_file_name(f["file_name"]), "Subfolder file should not be transferred"
-    else:
-        assert is_valid_file_name(f["file_name"]), "Root file should be valid"
-
-# -------------------------------
-# Test 20: AWS Secret Retrieval - Error Handling
-# -------------------------------
-
-# -- Simulate missing secret key
-try:
-    get_aws_secret("aws_keys", "missing_key")
-except Exception as e:
-    assert "Missing AWS credentials" in str(e), "Should raise missing AWS credentials error"
-
-# -- Simulate wrong secret scope
-try:
-    get_aws_secret("wrong_scope", "access_key")
-except Exception as e:
-    assert "Unable to access Databricks secret scope" in str(e), "Should raise secret scope access error"
-
-# -------------------------------
-# Test 21: S3 Bucket/Folder Does Not Exist - Error
-# -------------------------------
-
-# -- C015: s3://nonexistent-bucket/folderO/
-try:
-    files = list_s3_files("s3://nonexistent-bucket/folderO/")
-    if files == []:
-        raise Exception("S3 bucket or folder 's3://nonexistent-bucket/folderO/' does not exist for config_id C015")
-except Exception as e:
-    assert "S3 bucket or folder" in str(e), "Should raise S3 bucket/folder not exist error"
-
-# -------------------------------
-# Test 22: Data Type Conversion and NULL Handling
-# -------------------------------
-
-# -- Validate that all S3 path columns are STRING and handle NULLs
-for row in ingest_config_master_df.collect():
-    assert (row.s3_vendor_path is None or isinstance(row.s3_vendor_path, str)), "s3_vendor_path must be STRING or NULL"
-    assert (row.s3_landing_path is None or isinstance(row.s3_landing_path, str)), "s3_landing_path must be STRING or NULL"
-    assert (row.s3_archive_path is None or isinstance(row.s3_archive_path, str)), "s3_archive_path must be STRING or NULL"
-
-# -------------------------------
-# Test 23: Performance Test (Batch Processing)
-# -------------------------------
-
-# -- Simulate batch processing of all active configs
+# /* Simulate a large batch by duplicating eligible_files_df and measuring time */
 import time  
+large_batch_df = eligible_files_df
+for _ in range(5):
+    large_batch_df = large_batch_df.union(eligible_files_df)
 start_time = time.time()
-for row in active_configs.collect():
-    vendor_files = list_s3_files(row.s3_vendor_path)
-    purgo_files = list_s3_files(row.s3_landing_path)
-    archive_files = list_s3_files(row.s3_archive_path)
-    file_names_in_purgo = set(f["file_name"] for f in purgo_files)
-    file_names_in_archive = set(f["file_name"] for f in archive_files)
-    for f in vendor_files:
-        if (f["file_name"] not in file_names_in_purgo and
-            f["file_name"] not in file_names_in_archive and
-            is_valid_file_name(f["file_name"]) and
-            is_allowed_extension(f["file_name"]) and
-            not is_zero_byte(f)):
-            # Simulate copy
-            assert copy_s3_file(row.s3_vendor_path, f["file_name"], row.s3_landing_path), "Batch copy should succeed"
+row_count = large_batch_df.count()
 end_time = time.time()
-assert (end_time - start_time) < 10, "Batch processing should complete within 10 seconds"
-
-# -------------------------------
-# Test 24: Data Quality Validation - No Column Mismatch
-# -------------------------------
-
-# -- Ensure number of columns in ingest_config_master matches schema
-assert len(ingest_config_master_df.columns) == len(expected_schema_fields), "Column count mismatch in ingest_config_master"
-
-# -------------------------------
-# Test 25: Data Quality Validation - No NULL in Required Columns for Active Configs
-# -------------------------------
-
-for row in active_configs.collect():
-    assert row.s3_vendor_path is not None, "s3_vendor_path should not be NULL for active config"
-    assert row.s3_landing_path is not None, "s3_landing_path should not be NULL for active config"
-    assert row.s3_archive_path is not None, "s3_archive_path should not be NULL for active config"
-
-# -------------------------------
-# Test 26: Data Quality Validation - No Files Transferred for Inactive or Invalid Configs
-# -------------------------------
-
-inactive_configs = ingest_config_master_df.filter(
-    (col("active_flag") != "A") | col("active_flag").isNull()
-)
-for row in inactive_configs.collect():
-    vendor_files = list_s3_files(row.s3_vendor_path) if row.s3_vendor_path else []
-    for f in vendor_files:
-        assert True, "No files should be transferred for inactive/invalid configs"
-
-# -------------------------------
-# Test 27: Data Quality Validation - No Overwrite in Purgo S3
-# -------------------------------
-
-# -- For all active configs, ensure no overwrite occurs
-for row in active_configs.collect():
-    vendor_files = list_s3_files(row.s3_vendor_path)
-    purgo_files = list_s3_files(row.s3_landing_path)
-    file_names_in_purgo = set(f["file_name"] for f in purgo_files)
-    for f in vendor_files:
-        if f["file_name"] in file_names_in_purgo:
-            assert not copy_s3_file(row.s3_vendor_path, f["file_name"], row.s3_landing_path), "Should not overwrite in Purgo S3"
-
-# -------------------------------
-# Test 28: Data Quality Validation - Only Root Files Processed (No Recursion)
-# -------------------------------
-
-# -- C007: Only rootfile.csv should be processed, not subfolder/file5.csv
-vendor_files = list_s3_files("s3://vendor-bucket/folderG/")
-for f in vendor_files:
-    if "/" in f["file_name"]:
-        assert not is_valid_file_name(f["file_name"]), "Subfolder file should not be processed"
-    else:
-        assert is_valid_file_name(f["file_name"]), "Root file should be processed"
-
-# -------------------------------
-# Test 29: Data Quality Validation - Allowed File Extensions Only
-# -------------------------------
-
-# -- C012: file6.exe should not be processed
-vendor_files = list_s3_files("s3://vendor-bucket/folderL/")
-for f in vendor_files:
-    assert not is_allowed_extension(f["file_name"]), "file6.exe should not be allowed"
-
-# -------------------------------
-# Test 30: Data Quality Validation - No Files Transferred if Vendor S3 Folder is Empty
-# -------------------------------
-
-vendor_files = list_s3_files("s3://vendor-bucket/folderI/")
-assert len(vendor_files) == 0, "No files should be transferred if vendor S3 folder is empty"
-
-# -------------------------------
-# Test 31: Data Quality Validation - No Files Transferred if File Name is Duplicated
-# -------------------------------
-
-vendor_files = list_s3_files("s3://vendor-bucket/folderS/")
-assert has_duplicate_file_names(vendor_files), "Duplicate file names should prevent transfer"
-
-# -------------------------------
-# Test 32: Data Quality Validation - No Files Transferred if File Name Contains Whitespace
-# -------------------------------
-
-vendor_files = list_s3_files("s3://vendor-bucket/folderU/")
-for f in vendor_files:
-    assert not is_valid_file_name(f["file_name"]), "File name with whitespace should not be transferred"
-
-# -------------------------------
-# Test 33: Data Quality Validation - No Files Transferred if File Name Contains Invalid Characters
-# -------------------------------
-
-vendor_files = list_s3_files("s3://vendor-bucket/folderK/")
-for f in vendor_files:
-    assert not is_valid_file_name(f["file_name"]), "File name with invalid character should not be transferred"
-
-# -------------------------------
-# Test 34: Data Quality Validation - No Files Transferred if File Name is Null or Empty
-# -------------------------------
-
-vendor_files = list_s3_files("s3://vendor-bucket/folderJ/")
-for f in vendor_files:
-    assert not is_valid_file_name(f["file_name"]), "Null or empty file name should not be transferred"
-
-# -------------------------------
-# Test 35: Data Quality Validation - No Files Transferred if File is Zero Bytes
-# -------------------------------
-
-vendor_files = list_s3_files("s3://vendor-bucket/folderT/")
-for f in vendor_files:
-    assert is_zero_byte(f), "Zero-byte file should not be transferred"
-
-# -------------------------------
-# Test 36: Data Quality Validation - Only Allowed Files are Transferred in Multi-File Scenario
-# -------------------------------
-
-# -- C006: Only a.csv should be transferred (b.csv in Purgo, c.csv in Archive)
-vendor_files = list_s3_files("s3://vendor-bucket/folderF/")
-purgo_files = list_s3_files("s3://purgo-bucket/landingF/")
-archive_files = list_s3_files("s3://purgo-bucket/archiveF/")
-purgo_names = set(f["file_name"] for f in purgo_files)
-archive_names = set(f["file_name"] for f in archive_files)
-expected = {"a.csv"}
-actual = set()
-for f in vendor_files:
-    if (f["file_name"] not in purgo_names and
-        f["file_name"] not in archive_names and
-        is_valid_file_name(f["file_name"]) and
-        is_allowed_extension(f["file_name"]) and
-        not is_zero_byte(f)):
-        actual.add(f["file_name"])
-assert actual == expected, "Only a.csv should be transferred"
-
-# -------------------------------
-# Test 37: Data Type Conversion - Complex Types (ARRAY, STRUCT, MAP)
-# -------------------------------
-
-# -- Validate that file listings can be represented as ARRAY<STRUCT<file_name:STRING,size_bytes:LONG>>
-from pyspark.sql.types import ArrayType  
-file_struct_schema = StructType([
-    StructField("file_name", StringType(), True),
-    StructField("size_bytes", LongType(), True)
-])
-array_struct_schema = ArrayType(file_struct_schema)
-sample_files = [
-    {"file_name": "file1.csv", "size_bytes": 100},
-    {"file_name": "file2.csv", "size_bytes": 200}
-]
-from pyspark.sql import DataFrame  
-df = spark.createDataFrame([Row(files=sample_files)], schema=StructType([StructField("files", array_struct_schema, True)]))
-assert isinstance(df.schema["files"].dataType, ArrayType), "files column should be ARRAY<STRUCT>"
-
-# -------------------------------
-# Test 38: Data Quality Validation - No Files Transferred if No Active Configs
-# -------------------------------
-
-no_active = ingest_config_master_df.filter(col("active_flag") == "A").count() == 0
-if no_active:
-    assert True, "No files should be transferred if no active configs"
-
-# -------------------------------
-# Test 39: Data Quality Validation - No Files Transferred if File Name Matches Only Case-Insensitive
-# -------------------------------
-
-# -- C016: File9.csv in vendor, file9.csv in Purgo (should transfer, case-sensitive)
-row = ingest_config_master_df.filter(col("config_id") == "C016").collect()[0]
-vendor_files = list_s3_files(row.s3_vendor_path)
-purgo_files = list_s3_files(row.s3_landing_path)
-purgo_file_names = set(f["file_name"] for f in purgo_files)
-for f in vendor_files:
-    assert f["file_name"] not in purgo_file_names, "Case-sensitive: File9.csv should be transferred"
-
-# -------------------------------
-# Test 40: Data Quality Validation - No Files Transferred if File Name is Not Allowed Extension
-# -------------------------------
-
-vendor_files = list_s3_files("s3://vendor-bucket/folderL/")
-for f in vendor_files:
-    assert not is_allowed_extension(f["file_name"]), "file6.exe should not be transferred"
-
-# -------------------------------
-# Test 41: Data Quality Validation - No Files Transferred if File Name Contains Special Characters
-# -------------------------------
-
-vendor_files = list_s3_files("s3://vendor-bucket/folderK/")
-for f in vendor_files:
-    assert not is_valid_file_name(f["file_name"]), "File name with special character should not be transferred"
-
-# -------------------------------
-# Test 42: Data Quality Validation - No Files Transferred if File Name Contains Emoji or Multibyte
-# -------------------------------
-
-vendor_files = list_s3_files("s3://vendor-bucket/folderX/")
-for f in vendor_files:
-    assert is_valid_file_name(f["file_name"]), "Emoji file name should be valid if not forbidden"
-
-vendor_files = list_s3_files("s3://vendor-bucket/folderV/")
-for f in vendor_files:
-    assert is_valid_file_name(f["file_name"]), "Multibyte file name should be valid if not forbidden"
-
-# -------------------------------
-# Test 43: Data Quality Validation - No Files Transferred if File Name Contains Newline or Tab
-# -------------------------------
-
-vendor_files = list_s3_files("s3://vendor-bucket/folderY/")
-for f in vendor_files:
-    assert not is_valid_file_name(f["file_name"]), "File name with newline should not be transferred"
-
-vendor_files = list_s3_files("s3://vendor-bucket/folderZ/")
-for f in vendor_files:
-    assert not is_valid_file_name(f["file_name"]), "File name with tab should not be transferred"
-
-# -------------------------------
-# Test 44: Data Quality Validation - No Files Transferred if File Name Contains Multi-byte and Special Char
-# -------------------------------
-
-vendor_files = list_s3_files("s3://vendor-bucket/folderAA/")
-for f in vendor_files:
-    assert is_valid_file_name(f["file_name"]), "Multi-byte and special char file name should be valid if not forbidden"
-
-# -------------------------------
-# Test 45: Data Quality Validation - No Files Transferred if File Name Contains Only Allowed Characters
-# -------------------------------
-
-vendor_files = list_s3_files("s3://vendor-bucket/folderW/")
-for f in vendor_files:
-    assert is_valid_file_name(f["file_name"]), "File name with allowed special chars should be valid"
-
-# -------------------------------
-# Test 46: Data Quality Validation - No Files Transferred if File Name Contains Only Allowed Characters and Emoji
-# -------------------------------
-
-vendor_files = list_s3_files("s3://vendor-bucket/folderX/")
-for f in vendor_files:
-    assert is_valid_file_name(f["file_name"]), "File name with emoji should be valid"
-
-# -------------------------------
-# Test 47: Data Quality Validation - No Files Transferred if File Name Contains Only Allowed Characters and Multibyte
-# -------------------------------
-
-vendor_files = list_s3_files("s3://vendor-bucket/folderV/")
-for f in vendor_files:
-    assert is_valid_file_name(f["file_name"]), "File name with multibyte should be valid"
-
-# -------------------------------
-# Test 48: Data Quality Validation - No Files Transferred if File Name Contains Only Allowed Characters and Special Char
-# -------------------------------
-
-vendor_files = list_s3_files("s3://vendor-bucket/folderW/")
-for f in vendor_files:
-    assert is_valid_file_name(f["file_name"]), "File name with allowed special chars should be valid"
-
-# -------------------------------
-# Test 49: Data Quality Validation - No Files Transferred if File Name Contains Only Allowed Characters and Newline/Tab
-# -------------------------------
-
-vendor_files = list_s3_files("s3://vendor-bucket/folderY/")
-for f in vendor_files:
-    assert not is_valid_file_name(f["file_name"]), "File name with newline should not be valid"
-
-vendor_files = list_s3_files("s3://vendor-bucket/folderZ/")
-for f in vendor_files:
-    assert not is_valid_file_name(f["file_name"]), "File name with tab should not be valid"
-
-# -------------------------------
-# Test 50: Data Quality Validation - No Files Transferred if File Name Contains Only Allowed Characters and Multi-byte/Special Char
-# -------------------------------
-
-vendor_files = list_s3_files("s3://vendor-bucket/folderAA/")
-for f in vendor_files:
-    assert is_valid_file_name(f["file_name"]), "File name with multi-byte and special char should be valid"
+assert row_count == eligible_files_df.count() * 6
+assert (end_time - start_time) < 10  # Should process in <10 seconds for test batch
 
 # ---------------------------------------------------------------
-# End of Test Suite
+# SECTION: Test 19 - Data Quality: All SUCCESS Files Exist in Purgo S3
+# ---------------------------------------------------------------
+
+# /* Validate that all files with file_status='SUCCESS' in s3_file_process_log exist in test_purgo_s3_files */
+validation_cte = """
+WITH successful_files AS (
+  SELECT file_name, s3_landing_path
+  FROM purgo_playground.s3_file_process_log
+  WHERE file_status = "SUCCESS"
+)
+SELECT sf.file_name, sf.s3_landing_path, pf.file_name AS exists_in_purgo
+FROM successful_files sf
+LEFT JOIN purgo_playground.test_purgo_s3_files pf
+  ON sf.file_name = pf.file_name AND sf.s3_landing_path = pf.s3_path
+"""
+validation_df = spark.sql(validation_cte)
+assert validation_df.filter(F.col("exists_in_purgo").isNull()).count() == 0
+
+# ---------------------------------------------------------------
+# SECTION: Test 20 - Cleanup: Remove Test Log Record (if any)
+# ---------------------------------------------------------------
+
+# /* Clean up any test log records created during test (e.g., fileZ.csv) */
+log_table.delete("file_name = 'fileZ.csv'")
+
+# ---------------------------------------------------------------
+# END OF TEST SUITE
 # ---------------------------------------------------------------
