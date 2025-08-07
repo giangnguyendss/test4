@@ -1,0 +1,113 @@
+Feature: Channel-wise Sales Performance Analysis for Biosimilar Brands
+
+  This feature analyzes the sales performance of biosimilar brands (kanjinti, mvasi, riabni) across different sales channels (e.g., online, retail, mobile) by aggregating sales metrics from the table purgo_playground.bai_sales_agg_obu_customer_datapack. The analysis filters data within 36 months from a specified cdl_effective_date and groups results by brand, product, market, competitor flag, and channel.
+
+  Background:
+    Given the source table is "purgo_playground.bai_sales_agg_obu_customer_datapack"
+    And the columns used are:
+      | brand_normalized_name      | string  |
+      | normalized_name            | string  |
+      | market_normalized_name     | string  |
+      | competitor_flag            | boolean |
+      | channel_name               | string  |
+      | transaction_timestamp      | timestamp|
+      | integrated_units           | bigint  |
+      | integrated_normalized_units| bigint  |
+      | integrated_dollars         | bigint  |
+      | cdl_effective_date         | string  |
+    And the brands to include are "kanjinti", "mvasi", and "riabni"
+    And the sales data must be within 36 months from the provided reference cdl_effective_date parameter "<reference_cdl_effective_date>" in "yyyy-MM-dd" format
+    And the grouping attributes are brand_normalized_name, normalized_name, market_normalized_name, competitor_flag, channel_name
+    And the aggregation metrics are sum of integrated_units, sum of integrated_normalized_units, sum of integrated_dollars
+
+  Scenario Outline: Happy Path - Aggregate sales for valid biosimilar brands and valid cdl_effective_date within 36 months
+    Given the table contains records with brand_normalized_name in <brand_list>
+    And each record has a non-null, valid cdl_effective_date in "yyyy-MM-dd" format
+    And the difference in months between <reference_cdl_effective_date> and cdl_effective_date is less than or equal to 36
+    When the data is filtered for brand_normalized_name in <brand_list>
+    And the data is filtered for cdl_effective_date within 36 months from <reference_cdl_effective_date>
+    Then the result should group records by brand_normalized_name, normalized_name, market_normalized_name, competitor_flag, channel_name
+    And the result should show sum of integrated_units, sum of integrated_normalized_units, sum of integrated_dollars for each group
+    And the output should include all unique channel_name values present in the filtered data
+
+    Examples:
+      | brand_list                      | reference_cdl_effective_date |
+      | ["kanjinti", "mvasi", "riabni"] | 2023-01-01                  |
+      | ["kanjinti", "mvasi", "riabni"] | 2022-06-15                  |
+
+  Scenario: Error - Record with null cdl_effective_date
+    Given a record has brand_normalized_name in ["kanjinti", "mvasi", "riabni"]
+    And cdl_effective_date is null
+    When the data is filtered for cdl_effective_date within 36 months from <reference_cdl_effective_date>
+    Then the record should be excluded from the result set
+
+  Scenario: Error - Record with invalid cdl_effective_date format
+    Given a record has brand_normalized_name in ["kanjinti", "mvasi", "riabni"]
+    And cdl_effective_date is not in "yyyy-MM-dd" format (e.g., "2023/01/01", "01-01-2023", "invalid-date")
+    When the data is filtered for cdl_effective_date within 36 months from <reference_cdl_effective_date>
+    Then the record should be excluded from the result set
+
+  Scenario: Error - Record with brand not in the specified list
+    Given a record has brand_normalized_name not in ["kanjinti", "mvasi", "riabni"]
+    When the data is filtered for brand_normalized_name in ["kanjinti", "mvasi", "riabni"]
+    Then the record should be excluded from the result set
+
+  Scenario Outline: Error - Record outside 36 month window
+    Given a record has brand_normalized_name in ["kanjinti", "mvasi", "riabni"]
+    And cdl_effective_date is in "yyyy-MM-dd" format
+    And the difference in months between <reference_cdl_effective_date> and cdl_effective_date is greater than 36
+    When the data is filtered for cdl_effective_date within 36 months from <reference_cdl_effective_date>
+    Then the record should be excluded from the result set
+
+    Examples:
+      | reference_cdl_effective_date | cdl_effective_date |
+      | 2023-01-01                  | 2019-12-31         |
+      | 2022-06-15                  | 2018-05-01         |
+
+  Scenario: Output - Channel-wise aggregation includes all present channels
+    Given the filtered data contains channel_name values "online", "retail", "mobile", "other"
+    When the data is grouped by channel_name
+    Then the output should include a row for each channel_name present in the filtered data
+
+  Scenario: Output - Aggregation with zero sales
+    Given a group has no records after filtering
+    When the aggregation is performed
+    Then the output should not include a row for that group
+
+  Scenario: Output - Data type and format validation
+    Given the output is generated
+    Then brand_normalized_name, normalized_name, market_normalized_name, channel_name are strings
+    And competitor_flag is boolean
+    And sum of integrated_units, sum of integrated_normalized_units, sum of integrated_dollars are integers
+
+  Scenario: Error - No valid records after filtering
+    Given all records are excluded due to invalid brand, invalid cdl_effective_date, or outside 36 month window
+    When the aggregation is performed
+    Then the output should be an empty result set
+
+  Scenario: Error - Handling of duplicate records
+    Given duplicate records exist for the same group (same values for all grouping columns)
+    When the aggregation is performed
+    Then the sum of integrated_units, integrated_normalized_units, and integrated_dollars should include all duplicates
+
+  Scenario: Error - Handling of null sales metrics
+    Given a record has null values for integrated_units, integrated_normalized_units, or integrated_dollars
+    When the aggregation is performed
+    Then null values should be treated as zero in the sum
+
+  Scenario: Output - Sorting of results
+    Given the output is generated
+    When the results are returned
+    Then the output should be sorted by brand_normalized_name, normalized_name, market_normalized_name, competitor_flag, channel_name in ascending order
+
+  Scenario: Output - Output format
+    Given the output is generated
+    Then the output should be a table with columns:
+      | brand_normalized_name      |
+      | normalized_name            |
+      | market_normalized_name     |
+      | competitor_flag            |
+      | channel_name               |
+      | sum_integrated_units       |
+      | sum_integrated_normalized_units |
+      | sum_integrated_dollars     |
