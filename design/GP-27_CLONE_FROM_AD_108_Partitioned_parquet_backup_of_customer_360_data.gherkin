@@ -1,160 +1,489 @@
 Feature: Backup and Vacuum Operations for customer_360_raw Table
 
-  The system must efficiently back up the purgo_databricks.purgo_playground.customer_360_raw table as compressed parquet files partitioned by state, and perform a vacuum operation to retain only records from the last 30 days. All operations must be logged in purgo_playground.customer_360_raw_backup_log.
+  The system must efficiently back up the purgo_databricks.purgo_playground.customer_360_raw table as compressed parquet files partitioned by state in the specified Databricks volume, and perform a vacuum operation to retain only records from the last 30 days. All operations must be logged in purgo_playground.customer_360_raw_backup_log.
 
   Background:
     Given the source table is purgo_databricks.purgo_playground.customer_360_raw
-    And the backup parquet files must be stored in the Databricks volume at path "/Volumes/customer_360_raw_backup"
-    And the parquet files must use "snappy" compression codec
-    And all columns from the source table must be included in the backup
+    And the backup volume path is /Volumes/customer_360_raw_backup
+    And the backup parquet files must be compressed using snappy codec
+    And the backup must include all columns from the source table
     And the backup must be a full backup (all records)
-    And the backup operation must precede the vacuum operation
-    And the vacuum operation must be a hard delete, permanently removing old records
-    And the backup and vacuum operations must be performed daily at 02:00 UTC
-    And backup parquet files must be retained for 90 days in the volume
-    And the script must have read access to purgo_playground.customer_360_raw and write access to /Volumes/customer_360_raw_backup
-    And all operations must be logged in purgo_playground.customer_360_raw_backup_log with timestamp, status, operation_type, record_count, and error_message
+    And the vacuum operation must retain only records where creation_date >= current_date - 30 days
+    And the backup and vacuum operations must be logged in purgo_playground.customer_360_raw_backup_log with fields: timestamp, status, operation_type, record_count, error_message
+    And the backup and vacuum operations are triggered manually
 
-  Scenario: Successful full backup of customer_360_raw table to compressed parquet files partitioned by state
-    Given the purgo_playground.customer_360_raw table contains 100,000 records
+  Scenario: Successful backup of customer_360_raw table to compressed parquet files partitioned by state
+    Given the customer_360_raw table contains 10000 records with valid data
     When the backup operation is triggered
-    Then all 100,000 records are written to "/Volumes/customer_360_raw_backup" as parquet files
-    And the parquet files are partitioned by the "state" column
-    And the parquet files are compressed using "snappy"
-    And the backup log table purgo_playground.customer_360_raw_backup_log contains a record with
-      | status  | operation_type | record_count | error_message |
-      | SUCCESS | BACKUP        | 100000       | NULL          |
+    Then all 10000 records are written as parquet files to /Volumes/customer_360_raw_backup
+    And the parquet files are compressed using snappy codec
+    And the files are partitioned by the "state" column
+    And the backup operation status is logged as "SUCCESS" in customer_360_raw_backup_log with operation_type "BACKUP" and record_count 10000
+    And no error_message is recorded
 
-  Scenario: Successful vacuum operation retains only records from the last 30 days
-    Given the purgo_playground.customer_360_raw table contains records with creation_date ranging from 2024-03-01 to 2024-06-30
-    And today is 2024-06-30
+  Scenario: Successful vacuum of customer_360_raw table retaining only last 30 days of records
+    Given the customer_360_raw table contains records with creation_date ranging from 2023-01-01 to current_date
     When the vacuum operation is triggered
-    Then only records with creation_date >= 2024-05-31 are retained in purgo_playground.customer_360_raw
-    And all records with creation_date < 2024-05-31 are permanently deleted
-    And the backup log table purgo_playground.customer_360_raw_backup_log contains a record with
-      | status  | operation_type | record_count | error_message |
-      | SUCCESS | VACUUM        | <remaining>  | NULL          |
+    Then only records with creation_date >= current_date - 30 days remain in the table
+    And all records older than 30 days are permanently removed
+    And the vacuum operation status is logged as "SUCCESS" in customer_360_raw_backup_log with operation_type "VACUUM" and record_count equal to the number of records retained
+    And no error_message is recorded
 
-  Scenario: Backup operation fails due to insufficient write permissions
-    Given the script does not have write access to "/Volumes/customer_360_raw_backup"
+  Scenario Outline: Backup operation fails due to invalid volume path
+    Given the backup volume path is "<invalid_path>"
     When the backup operation is triggered
     Then no parquet files are written
-    And the backup log table purgo_playground.customer_360_raw_backup_log contains a record with
-      | status  | operation_type | record_count | error_message                      |
-      | FAILED  | BACKUP         | 0            | "Permission denied: write access"  |
+    And the backup operation status is logged as "FAILURE" in customer_360_raw_backup_log with operation_type "BACKUP" and record_count 0
+    And the error_message contains "Invalid volume path: <invalid_path>"
 
-  Scenario: Vacuum operation fails due to insufficient table permissions
-    Given the script does not have delete permissions on purgo_playground.customer_360_raw
-    When the vacuum operation is triggered
-    Then no records are deleted from purgo_playground.customer_360_raw
-    And the backup log table purgo_playground.customer_360_raw_backup_log contains a record with
-      | status  | operation_type | record_count | error_message                      |
-      | FAILED  | VACUUM         | 0            | "Permission denied: delete access" |
-
-  Scenario: Backup operation fails due to storage quota exceeded
-    Given the Databricks volume "/Volumes/customer_360_raw_backup" has less than 1GB free space
-    And the backup size is estimated to be 10GB
-    When the backup operation is triggered
-    Then no parquet files are written
-    And the backup log table purgo_playground.customer_360_raw_backup_log contains a record with
-      | status  | operation_type | record_count | error_message                |
-      | FAILED  | BACKUP         | 0            | "Insufficient storage space" |
-
-  Scenario: Backup operation fails due to data validation error (invalid email format)
-    Given the purgo_playground.customer_360_raw table contains a record with email = "invalid-email-format"
-    When the backup operation is triggered
-    Then the backup operation is aborted
-    And the backup log table purgo_playground.customer_360_raw_backup_log contains a record with
-      | status  | operation_type | record_count | error_message                        |
-      | FAILED  | BACKUP         | 0            | "Data validation error: invalid email format in record id=<id>" |
-
-  Scenario Outline: Data validation for required fields before backup
-    Given the purgo_playground.customer_360_raw table contains a record with <column> = <invalid_value>
-    When the backup operation is triggered
-    Then the backup operation is aborted
-    And the backup log table purgo_playground.customer_360_raw_backup_log contains a record with
-      | status  | operation_type | record_count | error_message                        |
-      | FAILED  | BACKUP         | 0            | "Data validation error: <error_msg>" |
     Examples:
-      | column     | invalid_value | error_msg                                 |
-      | email      | NULL          | email is NULL in record id=<id>           |
-      | id         | NULL          | id is NULL in record with email=<email>   |
-      | state      | NULL          | state is NULL in record id=<id>           |
+      | invalid_path                  |
+      | /Volumes/nonexistent_backup   |
+      | /Volumes/customer_360_invalid |
 
-  Scenario: Parquet backup files are deleted after retention period
-    Given a backup parquet file was created on 2024-03-01 in "/Volumes/customer_360_raw_backup"
-    And today is 2024-06-01
-    When the retention policy job runs
-    Then the backup parquet file from 2024-03-01 is deleted from "/Volumes/customer_360_raw_backup"
+  Scenario: Backup operation fails due to insufficient storage space
+    Given the backup volume path is /Volumes/customer_360_raw_backup
+    And the volume has less than 1GB free space
+    When the backup operation is triggered
+    Then no parquet files are written
+    And the backup operation status is logged as "FAILURE" in customer_360_raw_backup_log with operation_type "BACKUP" and record_count 0
+    And the error_message contains "Insufficient storage space"
 
-  Scenario: Logging of all backup and vacuum operations
+  Scenario: Vacuum operation fails due to table lock
+    Given the customer_360_raw table is locked by another process
+    When the vacuum operation is triggered
+    Then no records are removed
+    And the vacuum operation status is logged as "FAILURE" in customer_360_raw_backup_log with operation_type "VACUUM" and record_count 0
+    And the error_message contains "Table is locked"
+
+  Scenario: Backup operation fails due to missing source table
+    Given the customer_360_raw table does not exist
+    When the backup operation is triggered
+    Then no parquet files are written
+    And the backup operation status is logged as "FAILURE" in customer_360_raw_backup_log with operation_type "BACKUP" and record_count 0
+    And the error_message contains "Source table not found"
+
+  Scenario: Vacuum operation fails due to missing source table
+    Given the customer_360_raw table does not exist
+    When the vacuum operation is triggered
+    Then no records are removed
+    And the vacuum operation status is logged as "FAILURE" in customer_360_raw_backup_log with operation_type "VACUUM" and record_count 0
+    And the error_message contains "Source table not found"
+
+  Scenario Outline: Backup operation fails due to write permission error
+    Given the backup volume path is "<restricted_path>"
+    And the user does not have write permission to the volume
+    When the backup operation is triggered
+    Then no parquet files are written
+    And the backup operation status is logged as "FAILURE" in customer_360_raw_backup_log with operation_type "BACKUP" and record_count 0
+    And the error_message contains "Permission denied: <restricted_path>"
+
+    Examples:
+      | restricted_path                |
+      | /Volumes/customer_360_raw_backup |
+      | /Volumes/protected_backup        |
+
+  Scenario: Backup operation includes all columns and preserves data types
+    Given the customer_360_raw table contains columns: id (bigint), name (string), email (string), phone (string), company (string), job_title (string), address (string), city (string), state (string), country (string), industry (string), account_manager (string), creation_date (date), last_interaction_date (date), purchase_history (string), notes (string), zip (string)
+    When the backup operation is triggered
+    Then the parquet files contain all columns with matching data types as in the source table
+
+  Scenario: Backup operation overwrites previous backup files for the same partition
+    Given the backup volume path is /Volumes/customer_360_raw_backup
+    And parquet files for state="CA" already exist from a previous backup
+    When the backup operation is triggered
+    Then the new parquet files for state="CA" overwrite the previous files
+
+  Scenario: Logging of backup and vacuum operations
     Given a backup or vacuum operation is triggered
     When the operation completes (success or failure)
-    Then a record is inserted into purgo_playground.customer_360_raw_backup_log with
-      | timestamp          | status   | operation_type | record_count | error_message |
-      | <ISO8601 datetime> | <status> | <BACKUP|VACUUM>| <count>      | <error>       |
+    Then a log entry is created in customer_360_raw_backup_log with the following fields:
+      | timestamp         | ISO 8601 format, e.g., "2024-07-30T12:34:56Z" |
+      | status            | "SUCCESS" or "FAILURE"                        |
+      | operation_type    | "BACKUP" or "VACUUM"                          |
+      | record_count      | Number of records processed                   |
+      | error_message     | Error details if status is "FAILURE", else null |
 
-  Scenario: Backup and vacuum operations are scheduled and executed daily at 02:00 UTC
-    Given the current time is 02:00 UTC
-    When the scheduled job runs
-    Then the backup operation is performed
-    And the vacuum operation is performed immediately after backup
-
-  Scenario: Backup includes all columns from source table
-    Given the purgo_playground.customer_360_raw table has columns
-      | id | name | email | phone | company | job_title | address | city | state | country | industry | account_manager | creation_date | last_interaction_date | purchase_history | notes | zip |
+  Scenario: Data validation - backup file row count matches source table
+    Given the customer_360_raw table contains 5000 records
     When the backup operation is triggered
-    Then the parquet files in "/Volumes/customer_360_raw_backup" contain all columns as above
+    Then the total number of rows in the backup parquet files is 5000
 
-  Scenario: Parquet files are partitioned by state
-    Given the purgo_playground.customer_360_raw table contains records with state values "CA", "NY", "TX"
+  Scenario: Data validation - partitioning by state
+    Given the customer_360_raw table contains records with state values: "CA", "NY", "TX"
     When the backup operation is triggered
-    Then the parquet files in "/Volumes/customer_360_raw_backup" are partitioned into directories
-      | /Volumes/customer_360_raw_backup/state=CA/ |
-      | /Volumes/customer_360_raw_backup/state=NY/ |
-      | /Volumes/customer_360_raw_backup/state=TX/ |
+    Then the backup parquet files are partitioned into directories: /Volumes/customer_360_raw_backup/state=CA, /Volumes/customer_360_raw_backup/state=NY, /Volumes/customer_360_raw_backup/state=TX
 
-  Scenario: Parquet files are compressed using snappy
+  Scenario: Data validation - parquet file compression
     Given the backup operation is triggered
-    Then the resulting parquet files in "/Volumes/customer_360_raw_backup" use snappy compression
+    Then all output parquet files are compressed using snappy codec
 
-  Scenario: Only records from the last 30 days are retained after vacuum
-    Given today is 2024-06-30
-    And the purgo_playground.customer_360_raw table contains records with creation_date from 2024-05-01 to 2024-06-30
+  Scenario: Data validation - vacuum operation removes only records older than 30 days
+    Given the customer_360_raw table contains records with creation_date values both older and newer than current_date - 30 days
     When the vacuum operation is triggered
-    Then only records with creation_date >= 2024-05-31 are retained
+    Then only records with creation_date < current_date - 30 days are removed
+    And records with creation_date >= current_date - 30 days remain
 
-  Scenario: Error is logged if backup log table is unavailable
-    Given the purgo_playground.customer_360_raw_backup_log table is unavailable
-    When the backup or vacuum operation is triggered
-    Then the operation fails
-    And an error is raised: "Backup log table unavailable"
+  Scenario: Data validation - vacuum operation does not remove recent records
+    Given the customer_360_raw table contains only records with creation_date >= current_date - 30 days
+    When the vacuum operation is triggered
+    Then no records are removed
+    And the vacuum operation status is logged as "SUCCESS" with record_count equal to the total number of records
 
-  Scenario: Backup and vacuum operations are atomic and do not leave partial state
-    Given the backup operation is in progress
-    And a failure occurs before completion
-    Then no partial parquet files are left in "/Volumes/customer_360_raw_backup"
-    And the backup log table purgo_playground.customer_360_raw_backup_log contains a record with status "FAILED"
+  Scenario: Data validation - backup operation does not mask or exclude any columns
+    Given the backup operation is triggered
+    Then all columns from the source table are present in the backup parquet files
+    And no columns are masked or excluded
 
-  Scenario: Backup and vacuum operations are idempotent
-    Given the backup and vacuum operations are triggered multiple times within the same day
-    When the operations run
-    Then only one backup and one vacuum are performed per day
-    And duplicate log entries are not created for the same operation and day
-
-  Scenario: Backup and vacuum operations are auditable
-    Given the backup and vacuum operations are performed
-    Then all operation details are available in purgo_playground.customer_360_raw_backup_log for audit purposes
-
-  Scenario: Backup operation is incremental if specified
-    Given the backup type is set to "incremental"
-    And only records with creation_date > last backup date exist
+  Scenario: Data validation - backup operation preserves null values
+    Given the customer_360_raw table contains records with null values in some columns
     When the backup operation is triggered
-    Then only new or changed records are written to "/Volumes/customer_360_raw_backup"
-    And the backup log table purgo_playground.customer_360_raw_backup_log contains a record with the correct record_count
+    Then the corresponding fields in the backup parquet files are also null
 
-  Scenario: Backup operation is full if specified
-    Given the backup type is set to "full"
+  Scenario: Data validation - backup operation preserves data quality
+    Given the customer_360_raw table contains records with special characters, unicode, and long text in string columns
     When the backup operation is triggered
-    Then all records from purgo_playground.customer_360_raw are written to "/Volumes/customer_360_raw_backup"
-    And the backup log table purgo_playground.customer_360_raw_backup_log contains a record with the correct record_count
+    Then the backup parquet files preserve all data without truncation or corruption
+
+  Scenario: Data validation - backup operation preserves date formats
+    Given the customer_360_raw table contains creation_date and last_interaction_date columns with valid date values
+    When the backup operation is triggered
+    Then the date values in the backup parquet files match the source table
+
+  Scenario: Data validation - backup operation handles empty source table
+    Given the customer_360_raw table is empty
+    When the backup operation is triggered
+    Then no parquet files are written
+    And the backup operation status is logged as "SUCCESS" with record_count 0
+
+  Scenario: Data validation - vacuum operation handles empty source table
+    Given the customer_360_raw table is empty
+    When the vacuum operation is triggered
+    Then no records are removed
+    And the vacuum operation status is logged as "SUCCESS" with record_count 0
+
+  Scenario: Data validation - backup operation handles duplicate records
+    Given the customer_360_raw table contains duplicate records
+    When the backup operation is triggered
+    Then all records, including duplicates, are written to the backup parquet files
+
+  Scenario: Data validation - backup operation handles large datasets
+    Given the customer_360_raw table contains 10,000,000 records
+    When the backup operation is triggered
+    Then all 10,000,000 records are written as parquet files to /Volumes/customer_360_raw_backup
+    And the operation completes without data loss
+
+  Scenario: Data validation - backup operation handles all supported state values
+    Given the customer_360_raw table contains records with all valid US state codes
+    When the backup operation is triggered
+    Then the backup parquet files are partitioned by each state code present in the data
+
+  Scenario: Data validation - backup operation handles special characters in state values
+    Given the customer_360_raw table contains records with state values containing spaces or special characters
+    When the backup operation is triggered
+    Then the backup parquet files are partitioned using the exact state values, preserving special characters
+
+  Scenario: Data validation - backup operation handles null state values
+    Given the customer_360_raw table contains records with null in the state column
+    When the backup operation is triggered
+    Then the backup parquet files include a partition for state=null
+
+  Scenario: Data validation - backup operation handles non-ASCII characters in string columns
+    Given the customer_360_raw table contains records with non-ASCII characters in name, address, or notes columns
+    When the backup operation is triggered
+    Then the backup parquet files preserve all non-ASCII characters
+
+  Scenario: Data validation - backup operation handles long text fields
+    Given the customer_360_raw table contains records with notes or purchase_history fields longer than 1000 characters
+    When the backup operation is triggered
+    Then the backup parquet files preserve the full text without truncation
+
+  Scenario: Data validation - backup operation handles all nullable columns
+    Given the customer_360_raw table contains null values in any nullable column
+    When the backup operation is triggered
+    Then the backup parquet files preserve nulls in the corresponding columns
+
+  Scenario: Data validation - backup operation preserves record order (if required)
+    Given the customer_360_raw table contains records in a specific order
+    When the backup operation is triggered
+    Then the backup parquet files do not guarantee order unless explicitly sorted
+
+  Scenario: Data validation - backup operation does not modify source table
+    Given the backup operation is triggered
+    Then the customer_360_raw table remains unchanged
+
+  Scenario: Data validation - vacuum operation does not affect backup files
+    Given the vacuum operation is triggered
+    Then the backup parquet files in /Volumes/customer_360_raw_backup remain unchanged
+
+  Scenario: Data validation - backup operation does not update customer_360_raw_backup table
+    Given the backup operation is triggered
+    Then the customer_360_raw_backup table is not modified
+
+  Scenario: Data validation - backup and vacuum operations are idempotent
+    Given the backup and vacuum operations are triggered multiple times with no data changes
+    When the operations are triggered again
+    Then the results and log entries are consistent with previous runs
+
+  Scenario: Data validation - backup operation handles concurrent execution
+    Given two backup operations are triggered simultaneously
+    When both operations run
+    Then only one set of backup files is written per partition
+    And both operations are logged in customer_360_raw_backup_log
+
+  Scenario: Data validation - vacuum operation handles concurrent execution
+    Given two vacuum operations are triggered simultaneously
+    When both operations run
+    Then only one vacuum operation completes successfully
+    And both operations are logged in customer_360_raw_backup_log
+
+  Scenario: Data validation - backup operation handles schema evolution (new columns)
+    Given the customer_360_raw table schema is updated with a new column "customer_segment" (string)
+    When the backup operation is triggered
+    Then the backup parquet files include the new column with correct data type
+
+  Scenario: Data validation - backup operation handles schema evolution (dropped columns)
+    Given the customer_360_raw table schema has a column "legacy_id" (bigint) that is dropped
+    When the backup operation is triggered
+    Then the backup parquet files do not include the dropped column
+
+  Scenario: Data validation - backup operation handles schema evolution (column type change)
+    Given the customer_360_raw table column "zip" changes from string to integer
+    When the backup operation is triggered
+    Then the backup parquet files store "zip" as integer
+
+  Scenario: Data validation - backup operation handles empty partitions
+    Given the customer_360_raw table contains no records for state="NV"
+    When the backup operation is triggered
+    Then no partition directory is created for state="NV"
+
+  Scenario: Data validation - backup operation handles case sensitivity in state values
+    Given the customer_360_raw table contains records with state values "ca", "CA", "Ca"
+    When the backup operation is triggered
+    Then partition directories are created for each distinct state value as present in the data
+
+  Scenario: Data validation - backup operation handles whitespace in state values
+    Given the customer_360_raw table contains records with state values " CA ", "CA"
+    When the backup operation is triggered
+    Then partition directories are created for each distinct state value as present in the data, including whitespace
+
+  Scenario: Data validation - backup operation handles special characters in file paths
+    Given the customer_360_raw table contains state values with special characters (e.g., "N/A", "Unknown-State")
+    When the backup operation is triggered
+    Then partition directories are created using the exact state values, encoding special characters as required by the file system
+
+  Scenario: Data validation - backup operation handles large number of partitions
+    Given the customer_360_raw table contains records with 1000 unique state values
+    When the backup operation is triggered
+    Then 1000 partition directories are created in /Volumes/customer_360_raw_backup
+
+  Scenario: Data validation - backup operation handles records with missing state values
+    Given the customer_360_raw table contains records with null or empty string in the state column
+    When the backup operation is triggered
+    Then a partition directory is created for state=null and/or state=""
+
+  Scenario: Data validation - backup operation handles records with future creation_date
+    Given the customer_360_raw table contains records with creation_date > current_date
+    When the backup operation is triggered
+    Then all records are backed up regardless of creation_date
+
+  Scenario: Data validation - vacuum operation does not remove records with future creation_date
+    Given the customer_360_raw table contains records with creation_date > current_date
+    When the vacuum operation is triggered
+    Then records with creation_date > current_date are retained
+
+  Scenario: Data validation - backup operation handles records with invalid email or phone formats
+    Given the customer_360_raw table contains records with invalid email or phone formats
+    When the backup operation is triggered
+    Then all records are backed up without validation or modification of email or phone formats
+
+  Scenario: Data validation - backup operation handles records with special unicode characters
+    Given the customer_360_raw table contains records with special unicode characters in any string column
+    When the backup operation is triggered
+    Then the backup parquet files preserve all unicode characters
+
+  Scenario: Data validation - backup operation handles records with empty string values
+    Given the customer_360_raw table contains records with empty string values in any column
+    When the backup operation is triggered
+    Then the backup parquet files preserve empty string values
+
+  Scenario: Data validation - backup operation handles records with maximum allowed field lengths
+    Given the customer_360_raw table contains records with maximum allowed field lengths for each column
+    When the backup operation is triggered
+    Then the backup parquet files preserve the full field values without truncation
+
+  Scenario: Data validation - backup operation handles records with special characters in file names
+    Given the customer_360_raw table contains state values with characters not allowed in file names (e.g., "/", "\", ":", "*", "?", "\"", "<", ">", "|")
+    When the backup operation is triggered
+    Then partition directories are created with sanitized or encoded state values as required by the file system
+
+  Scenario: Data validation - backup operation handles records with leading/trailing whitespace in state values
+    Given the customer_360_raw table contains records with state values " CA", "CA ", " CA "
+    When the backup operation is triggered
+    Then partition directories are created for each distinct state value as present in the data, including whitespace
+
+  Scenario: Data validation - backup operation handles records with mixed case state values
+    Given the customer_360_raw table contains records with state values "ca", "CA", "Ca"
+    When the backup operation is triggered
+    Then partition directories are created for each distinct state value as present in the data
+
+  Scenario: Data validation - backup operation handles records with null values in all columns except id
+    Given the customer_360_raw table contains records where all columns except id are null
+    When the backup operation is triggered
+    Then the backup parquet files preserve nulls in all columns except id
+
+  Scenario: Data validation - backup operation handles records with duplicate ids
+    Given the customer_360_raw table contains records with duplicate id values
+    When the backup operation is triggered
+    Then all records, including those with duplicate ids, are written to the backup parquet files
+
+  Scenario: Data validation - backup operation handles records with negative or zero id values
+    Given the customer_360_raw table contains records with id values of 0 or negative numbers
+    When the backup operation is triggered
+    Then all records are backed up without modification to id values
+
+  Scenario: Data validation - backup operation handles records with null id values
+    Given the customer_360_raw table contains records with null id values
+    When the backup operation is triggered
+    Then the backup parquet files preserve null id values
+
+  Scenario: Data validation - backup operation handles records with null creation_date or last_interaction_date
+    Given the customer_360_raw table contains records with null creation_date or last_interaction_date
+    When the backup operation is triggered
+    Then the backup parquet files preserve null date values
+
+  Scenario: Data validation - backup operation handles records with invalid date formats
+    Given the customer_360_raw table contains records with invalid date formats in creation_date or last_interaction_date
+    When the backup operation is triggered
+    Then the backup operation fails
+    And the backup operation status is logged as "FAILURE" with an error_message indicating "Invalid date format"
+
+  Scenario: Data validation - backup operation handles records with null or empty purchase_history
+    Given the customer_360_raw table contains records with null or empty purchase_history
+    When the backup operation is triggered
+    Then the backup parquet files preserve null or empty purchase_history values
+
+  Scenario: Data validation - backup operation handles records with special characters in purchase_history
+    Given the customer_360_raw table contains records with special characters in purchase_history
+    When the backup operation is triggered
+    Then the backup parquet files preserve all special characters
+
+  Scenario: Data validation - backup operation handles records with null or empty notes
+    Given the customer_360_raw table contains records with null or empty notes
+    When the backup operation is triggered
+    Then the backup parquet files preserve null or empty notes values
+
+  Scenario: Data validation - backup operation handles records with special characters in notes
+    Given the customer_360_raw table contains records with special characters in notes
+    When the backup operation is triggered
+    Then the backup parquet files preserve all special characters
+
+  Scenario: Data validation - backup operation handles records with null or empty zip
+    Given the customer_360_raw table contains records with null or empty zip
+    When the backup operation is triggered
+    Then the backup parquet files preserve null or empty zip values
+
+  Scenario: Data validation - backup operation handles records with special characters in zip
+    Given the customer_360_raw table contains records with special characters in zip
+    When the backup operation is triggered
+    Then the backup parquet files preserve all special characters
+
+  Scenario: Data validation - backup operation handles records with null or empty company
+    Given the customer_360_raw table contains records with null or empty company
+    When the backup operation is triggered
+    Then the backup parquet files preserve null or empty company values
+
+  Scenario: Data validation - backup operation handles records with special characters in company
+    Given the customer_360_raw table contains records with special characters in company
+    When the backup operation is triggered
+    Then the backup parquet files preserve all special characters
+
+  Scenario: Data validation - backup operation handles records with null or empty job_title
+    Given the customer_360_raw table contains records with null or empty job_title
+    When the backup operation is triggered
+    Then the backup parquet files preserve null or empty job_title values
+
+  Scenario: Data validation - backup operation handles records with special characters in job_title
+    Given the customer_360_raw table contains records with special characters in job_title
+    When the backup operation is triggered
+    Then the backup parquet files preserve all special characters
+
+  Scenario: Data validation - backup operation handles records with null or empty address
+    Given the customer_360_raw table contains records with null or empty address
+    When the backup operation is triggered
+    Then the backup parquet files preserve null or empty address values
+
+  Scenario: Data validation - backup operation handles records with special characters in address
+    Given the customer_360_raw table contains records with special characters in address
+    When the backup operation is triggered
+    Then the backup parquet files preserve all special characters
+
+  Scenario: Data validation - backup operation handles records with null or empty city
+    Given the customer_360_raw table contains records with null or empty city
+    When the backup operation is triggered
+    Then the backup parquet files preserve null or empty city values
+
+  Scenario: Data validation - backup operation handles records with special characters in city
+    Given the customer_360_raw table contains records with special characters in city
+    When the backup operation is triggered
+    Then the backup parquet files preserve all special characters
+
+  Scenario: Data validation - backup operation handles records with null or empty country
+    Given the customer_360_raw table contains records with null or empty country
+    When the backup operation is triggered
+    Then the backup parquet files preserve null or empty country values
+
+  Scenario: Data validation - backup operation handles records with special characters in country
+    Given the customer_360_raw table contains records with special characters in country
+    When the backup operation is triggered
+    Then the backup parquet files preserve all special characters
+
+  Scenario: Data validation - backup operation handles records with null or empty industry
+    Given the customer_360_raw table contains records with null or empty industry
+    When the backup operation is triggered
+    Then the backup parquet files preserve null or empty industry values
+
+  Scenario: Data validation - backup operation handles records with special characters in industry
+    Given the customer_360_raw table contains records with special characters in industry
+    When the backup operation is triggered
+    Then the backup parquet files preserve all special characters
+
+  Scenario: Data validation - backup operation handles records with null or empty account_manager
+    Given the customer_360_raw table contains records with null or empty account_manager
+    When the backup operation is triggered
+    Then the backup parquet files preserve null or empty account_manager values
+
+  Scenario: Data validation - backup operation handles records with special characters in account_manager
+    Given the customer_360_raw table contains records with special characters in account_manager
+    When the backup operation is triggered
+    Then the backup parquet files preserve all special characters
+
+  Scenario: Data validation - backup operation handles records with null or empty email
+    Given the customer_360_raw table contains records with null or empty email
+    When the backup operation is triggered
+    Then the backup parquet files preserve null or empty email values
+
+  Scenario: Data validation - backup operation handles records with special characters in email
+    Given the customer_360_raw table contains records with special characters in email
+    When the backup operation is triggered
+    Then the backup parquet files preserve all special characters
+
+  Scenario: Data validation - backup operation handles records with null or empty phone
+    Given the customer_360_raw table contains records with null or empty phone
+    When the backup operation is triggered
+    Then the backup parquet files preserve null or empty phone values
+
+  Scenario: Data validation - backup operation handles records with special characters in phone
+    Given the customer_360_raw table contains records with special characters in phone
+    When the backup operation is triggered
+    Then the backup parquet files preserve all special characters
+
+  Scenario: Data validation - backup operation handles records with null or empty name
+    Given the customer_360_raw table contains records with null or empty name
+    When the backup operation is triggered
+    Then the backup parquet files preserve null or empty name values
+
+  Scenario: Data validation - backup operation handles records with special characters in name
+    Given the customer_360_raw table contains records with special characters in name
+    When the backup operation is triggered
+    Then the backup parquet files preserve all special characters
