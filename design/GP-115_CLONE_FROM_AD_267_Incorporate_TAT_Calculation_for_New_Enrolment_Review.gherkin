@@ -1,0 +1,127 @@
+Feature: Calculate Total Time Elapsed (TAT) for New Enrollment Review in tat_report
+
+  This feature calculates the total_time_elapsed for each case in purgo_playground.pat_case
+  where service_request_type is "Patient Foundation" and there exists a matching record in
+  purgo_playground.sr_activity with subject "Perform New Enrollment Review Activity" and status "Completed".
+  The calculation is based on the difference in days between sr_created_date (start date) and the minimum
+  last_modified_date (end date) for the case_id, adjusted for weekends. The result is loaded into
+  purgo_playground.tat_report with all columns from pat_case plus end_date and total_time_elapsed.
+
+  Background:
+    Given the Unity Catalog is purgo_databricks
+    And the schema is purgo_playground
+    And the user has read access to pat_case and sr_activity tables
+    And the user has write access to tat_report table
+    And the date format for sr_created_date and last_modified_date is timestamp (yyyy-MM-dd HH:mm:ss)
+    And only the date part (yyyy-MM-dd) is used for calculations, time is discarded
+
+  # Happy Path Scenario
+  Scenario: Calculate total_time_elapsed for valid New Enrollment Review case
+    Given a record in pat_case with
+      | case_id | service_request_type | sr_created_date        |
+      | C123    | Patient Foundation   | 2024-06-01 10:15:00    |
+    And one or more records in sr_activity with
+      | case_id | subject                           | status     | last_modified_date      |
+      | C123    | Perform New Enrollment Review Activity | Completed | 2024-06-05 09:00:00    |
+      | C123    | Perform New Enrollment Review Activity | Completed | 2024-06-04 15:30:00    |
+    When the PySpark script runs
+    Then the start date is "2024-06-01"
+    And the end date is the minimum last_modified_date "2024-06-04"
+    And total_time_elapsed is calculated as the number of weekdays between start date and end date
+    And weekends (Saturday, Sunday) are excluded from the count
+    And the result is loaded into tat_report with
+      | case_id | service_request_type | sr_created_date        | end_date           | total_time_elapsed |
+      | C123    | Patient Foundation   | 2024-06-01 10:15:00    | 2024-06-04 15:30:00| 2                 |
+
+  # Error Scenarios
+  Scenario Outline: Error conditions for total_time_elapsed calculation
+    Given a record in pat_case with
+      | case_id | service_request_type | sr_created_date        |
+      | <case_id> | <service_request_type> | <sr_created_date>   |
+    And <activity_condition>
+    When the PySpark script runs
+    Then total_time_elapsed is populated as <expected_total_time_elapsed>
+    And end_date is populated as <expected_end_date>
+    And the result is loaded into tat_report
+
+    Examples:
+      | case_id | service_request_type | sr_created_date        | activity_condition                                                                 | expected_total_time_elapsed | expected_end_date         |
+      | C124    | Patient Foundation   | 2024-06-10 08:00:00    | no matching sr_activity record for case_id                                         | NULL                       | NULL                      |
+      | C125    | Patient Foundation   | NULL                   | matching sr_activity with subject and status, last_modified_date = 2024-06-12      | NULL                       | 2024-06-12 00:00:00       |
+      | C126    | Patient Foundation   | 2024-06-15 12:00:00    | matching sr_activity with subject and status, last_modified_date = NULL            | NULL                       | NULL                      |
+      | C127    | Patient Foundation   | 2024-06-20 09:00:00    | matching sr_activity with subject and status, last_modified_date = 2024-06-18      | NULL                       | 2024-06-18 00:00:00       |
+      | C128    | Patient Foundation   | 2024-06-22 09:00:00    | matching sr_activity with subject and status, last_modified_date = 2024-06-22      | 0                          | 2024-06-22 00:00:00       |
+
+  # Data-Driven Scenario for Multiple Activities
+  Scenario Outline: Multiple matching sr_activity records per case_id
+    Given a record in pat_case with
+      | case_id | service_request_type | sr_created_date        |
+      | <case_id> | Patient Foundation   | <sr_created_date>     |
+    And multiple records in sr_activity with
+      | case_id | subject                           | status     | last_modified_date      |
+      | <case_id> | Perform New Enrollment Review Activity | Completed | <last_modified_date_1> |
+      | <case_id> | Perform New Enrollment Review Activity | Completed | <last_modified_date_2> |
+      | <case_id> | Perform New Enrollment Review Activity | Completed | <last_modified_date_3> |
+    When the PySpark script runs
+    Then the end date is the minimum of last_modified_date values
+    And total_time_elapsed is calculated as the number of weekdays between start date and end date
+    And weekends are excluded from the count
+    And the result is loaded into tat_report
+
+    Examples:
+      | case_id | sr_created_date        | last_modified_date_1   | last_modified_date_2   | last_modified_date_3   | expected_end_date         | expected_total_time_elapsed |
+      | C129    | 2024-06-01 10:00:00    | 2024-06-05 09:00:00    | 2024-06-04 15:30:00    | 2024-06-06 12:00:00    | 2024-06-04 15:30:00       | 2                          |
+      | C130    | 2024-06-07 08:00:00    | 2024-06-10 09:00:00    | 2024-06-09 15:30:00    | 2024-06-08 12:00:00    | 2024-06-08 12:00:00       | 1                          |
+
+  # Validation Rules
+  Scenario: Validation rules for total_time_elapsed calculation
+    Given start date and end date are both not NULL
+    When end date < start date
+    Then total_time_elapsed is populated as NULL
+
+    Given start date and end date are both not NULL
+    When end date = start date
+    Then total_time_elapsed is populated as 0
+
+    Given either start date or end date is NULL
+    When the PySpark script runs
+    Then total_time_elapsed is populated as NULL
+
+  # Data Filtering Scenario
+  Scenario: Filter only active cases with service_request_type "Patient Foundation"
+    Given pat_case records with various service_request_type values
+    When the PySpark script runs
+    Then only records with service_request_type = "Patient Foundation" are processed
+
+  # Output Schema Scenario
+  Scenario: Output schema for tat_report table
+    Given a valid calculation for total_time_elapsed
+    When the result is loaded into tat_report
+    Then tat_report contains columns:
+      | case_id | service_request_type | sr_created_date | end_date | total_time_elapsed |
+
+  # NULL Representation Scenario
+  Scenario: NULL value representation in tat_report
+    Given total_time_elapsed or end_date is not available due to validation rules
+    When the result is loaded into tat_report
+    Then the value is stored as SQL NULL (not string "NULL")
+
+  # Security and Permissions Scenario
+  Scenario: Unity Catalog permissions for script execution
+    Given the script is executed in purgo_databricks Unity Catalog
+    When accessing pat_case, sr_activity, and tat_report tables
+    Then the user must have SELECT permission on pat_case and sr_activity
+    And the user must have INSERT/UPDATE permission on tat_report
+
+  # Table Update Strategy Scenario
+  Scenario: Overwrite tat_report table on each run
+    Given the PySpark script is scheduled to run as a batch job
+    When the script completes successfully
+    Then tat_report table is overwritten with the latest results
+
+  # Scheduling Scenario
+  Scenario: Batch scheduling of PySpark script
+    Given the requirement for regular updates
+    When the script is deployed
+    Then it is scheduled to run daily at 02:00 AM UTC
+
