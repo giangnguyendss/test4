@@ -1,0 +1,166 @@
+Feature: Patient Account Table Creation and ETL from pa_account Source
+
+  The system must create the target table purgo_playground.patient_account in Unity Catalog purgo_databricks, dropping it if it already exists, and populate it from purgo_playground.pa_account according to the mapping specification. The ETL must enforce all transformation, filtering, and validation rules, and handle error scenarios as specified.
+
+  Background:
+    Given the source table purgo_playground.pa_account exists
+    And the target table purgo_playground.patient_account will be dropped if it already exists
+    And the target table purgo_playground.patient_account will be created with the following schema:
+      | Column                      | Datatype  | Nullable |
+      | patient_foundation_shipment | string    | No       |
+      | prescriber_id               | string    | No       |
+      | prescriber_key              | string    | No       |
+      | patient_sf_id               | string    | No       |
+      | service_request_type        | string    | No       |
+      | case_sf_id                  | string    | No       |
+      | account_id                  | string    | No       |
+      | hash_key                    | string    | No       |
+      | last_modified_date          | timestamp | No       |
+      | planned_date                | date      | Yes      |
+
+  # Happy Path: Valid record transformation and insertion
+  Scenario: ETL inserts valid patient_account records from pa_account
+    Given a pa_account record with:
+      | patient_foundation_shipment | prescriber_name_c | prescriber_name_c_address | patinet_c | recordtypeid | id | accountid |
+      | "SHIP123"                  | "Dr. John Smith"  | "123 Main St"            | "PAT001"  | "SRV"        | "CASE001"  | "ACC001"  |
+    And patinet_c contains "PAT" (case-insensitive)
+    When the ETL process runs
+    Then a patient_account record is created with:
+      | patient_foundation_shipment | prescriber_id      | prescriber_key           | patient_sf_id | service_request_type | case_sf_id | account_id | hash_key                  | last_modified_date | planned_date |
+      | "SHIP123"                  | "Dr. John Smith"   | "Dr. 123 Main St"        | "PAT001"      | "SRV"                | "CASE001"  | "ACC001"   | "PAT001#SRV#CASE001#ACC001" | <current timestamp> | null         |
+
+  # Transformation logic for prescriber_id and prescriber_key
+  Scenario Outline: Prescriber prefix transformation for prescriber_id and prescriber_key
+    Given a pa_account record with:
+      | prescriber_name_c         | prescriber_name_c_address |
+      | <prescriber_name_c>       | <prescriber_name_c_address> |
+    And patinet_c contains "PAT"
+    When the ETL process runs
+    Then the patient_account record has:
+      | prescriber_id | prescriber_key |
+      | <expected_id> | <expected_key> |
+    Examples:
+      | prescriber_name_c   | prescriber_name_c_address | expected_id         | expected_key           |
+      | "John Smith"        | "123 Main St"             | "Dr. John Smith"   | "Dr. 123 Main St"      |
+      | "Dr. Jane Doe"      | "456 Oak Ave"             | "Dr. Jane Doe"     | "Dr. 456 Oak Ave"      |
+      | "Ms. Alice Brown"   | "789 Pine Rd"             | "Dr. Ms. Alice Brown" | "Dr. 789 Pine Rd"   |
+
+  # Filtering logic for patinet_c
+  Scenario Outline: Filtering records based on patinet_c containing 'PAT'
+    Given a pa_account record with patinet_c = <patinet_c>
+    When the ETL process runs
+    Then the record <should_be_included> in patient_account
+    Examples:
+      | patinet_c   | should_be_included |
+      | "PAT001"    | is included        |
+      | "pat002"    | is included        |
+      | "123456"    | is not included    |
+      | "PATIENTX"  | is included        |
+      | "XYZ"       | is not included    |
+
+  # Hash key generation and uniqueness
+  Scenario: Hash key is generated and must be unique
+    Given two pa_account records with:
+      | patinet_c | recordtypeid | id       | accountid |
+      | "PAT001"  | "SRV"        | "CASE001"| "ACC001"  |
+      | "PAT001"  | "SRV"        | "CASE001"| "ACC001"  |
+    When the ETL process runs
+    Then only one patient_account record is created with hash_key "PAT001#SRV#CASE001#ACC001"
+    And duplicate hash_key records are not inserted
+
+  # last_modified_date population
+  Scenario: last_modified_date is set to ETL execution timestamp
+    Given a valid pa_account record
+    When the ETL process runs
+    Then last_modified_date in patient_account is set to the ETL execution timestamp
+
+  # planned_date handling
+  Scenario Outline: planned_date is nullable and not mapped from source
+    Given a pa_account record with all required fields
+    When the ETL process runs
+    Then planned_date in patient_account is null
+
+  # Not Null validation and error handling
+  Scenario Outline: Source columns required as NOT NULL are null
+    Given a pa_account record with <null_column> = null and patinet_c contains "PAT"
+    When the ETL process runs
+    Then the record is not inserted into patient_account
+    And an error is logged in pat_account_error_log with:
+      | hash_key                  | error_col         | error_message                |
+      | <generated_hash_key>      | <null_column>     | "<null_column> is required"  |
+    Examples:
+      | null_column                  | generated_hash_key                |
+      | patient_foundation_shipment  | "PAT001#SRV#CASE001#ACC001"       |
+      | prescriber_name_c            | "PAT001#SRV#CASE001#ACC001"       |
+      | prescriber_name_c_address    | "PAT001#SRV#CASE001#ACC001"       |
+      | patinet_c                    | "PAT001#SRV#CASE001#ACC001"       |
+      | recordtypeid                 | "PAT001#SRV#CASE001#ACC001"       |
+      | id                           | "PAT001#SRV#CASE001#ACC001"       |
+      | accountid                    | "PAT001#SRV#CASE001#ACC001"       |
+
+  # Error scenario: Invalid data format
+  Scenario Outline: Invalid data format in source columns
+    Given a pa_account record with <column> = <invalid_value> and patinet_c contains "PAT"
+    When the ETL process runs
+    Then the record is not inserted into patient_account
+    And an error is logged in pat_account_error_log with:
+      | hash_key                  | error_col         | error_message                |
+      | <generated_hash_key>      | <column>          | "Invalid format for <column>"|
+    Examples:
+      | column                     | invalid_value         | generated_hash_key                |
+      | patient_foundation_shipment| ""                    | "PAT001#SRV#CASE001#ACC001"       |
+      | recordtypeid               | null                  | "PAT001#SRV#CASE001#ACC001"       |
+      | id                         | " "                   | "PAT001#SRV#CASE001#ACC001"       |
+
+  # Error scenario: Source table does not exist
+  Scenario: Source table pa_account does not exist
+    Given the source table purgo_playground.pa_account does not exist
+    When the ETL process runs
+    Then no patient_account records are created
+    And an error is logged in pat_account_error_log with:
+      | hash_key | error_col | error_message |
+      | null     | "source"  | "Source table pa_account does not exist" |
+
+  # Error scenario: Duplicate hash_key in source
+  Scenario: Duplicate hash_key records in source
+    Given pa_account contains multiple records with the same hash_key
+    When the ETL process runs
+    Then only one patient_account record is created per unique hash_key
+    And duplicates are logged in pat_account_error_log with:
+      | hash_key                  | error_col | error_message                  |
+      | "PAT001#SRV#CASE001#ACC001" | "hash_key" | "Duplicate hash_key in source" |
+
+  # Data-driven ETL validation
+  Scenario Outline: Data-driven ETL validation for multiple records
+    Given pa_account contains the following records:
+      | patient_foundation_shipment | prescriber_name_c | prescriber_name_c_address | patinet_c | recordtypeid | id | accountid |
+      | <patient_foundation_shipment> | <prescriber_name_c> | <prescriber_name_c_address> | <patinet_c> | <recordtypeid> | <id> | <accountid> |
+    When the ETL process runs
+    Then patient_account contains the following records:
+      | patient_foundation_shipment | prescriber_id      | prescriber_key           | patient_sf_id | service_request_type | case_sf_id | account_id | hash_key                  | last_modified_date | planned_date |
+      | <patient_foundation_shipment> | <expected_id>     | <expected_key>           | <patinet_c>   | <recordtypeid>      | <id>       | <accountid>| <expected_hash_key>       | <current timestamp>| null         |
+    Examples:
+      | patient_foundation_shipment | prescriber_name_c | prescriber_name_c_address | patinet_c | recordtypeid | id       | accountid | expected_id         | expected_key           | expected_hash_key              |
+      | "SHIP123"                  | "John Smith"      | "123 Main St"            | "PAT001"  | "SRV"        | "CASE001"| "ACC001"  | "Dr. John Smith"   | "Dr. 123 Main St"      | "PAT001#SRV#CASE001#ACC001"    |
+      | "SHIP456"                  | "Dr. Jane Doe"    | "456 Oak Ave"            | "PAT002"  | "SRV2"       | "CASE002"| "ACC002"  | "Dr. Jane Doe"     | "Dr. 456 Oak Ave"      | "PAT002#SRV2#CASE002#ACC002"   |
+      | "SHIP789"                  | "Ms. Alice Brown" | "789 Pine Rd"            | "PAT003"  | "SRV3"       | "CASE003"| "ACC003"  | "Dr. Ms. Alice Brown" | "Dr. 789 Pine Rd"   | "PAT003#SRV3#CASE003#ACC003"   |
+
+  # Performance constraint scenario
+  Scenario: ETL handles large data volume efficiently
+    Given pa_account contains 1,000,000 valid records with patinet_c containing "PAT"
+    When the ETL process runs
+    Then all 1,000,000 records are inserted into patient_account within the defined SLA
+    And no performance errors are logged
+
+  # SQL DDL and ETL acceptance
+  Scenario: SQL DDL and ETL code generation
+    Given the mapping specification and requirements
+    When the SQL DDL and ETL code is generated
+    Then the SQL code:
+      | Drops purgo_playground.patient_account if exists |
+      | Creates purgo_playground.patient_account with specified schema |
+      | Implements all transformation, filtering, and validation rules |
+      | Ensures hash_key uniqueness |
+      | Sets last_modified_date to current timestamp |
+      | Sets planned_date to null |
+      | Logs errors to pat_account_error_log as specified |
