@@ -1,0 +1,161 @@
+Feature: Agent Log Calculated Field Query in Databricks SQL
+
+  The Agent Log query must display a calculated field in purgo_playground.agent_log, using mapped source data and business logic. The query must handle missing/ambiguous data, apply required filters, and generate a unique surrogate key per row.
+
+  Background:
+    Given Unity Catalog is "purgo_databricks"
+    And Schema is "purgo_playground"
+    And Source tables are "session_tracking_data", "user_presence_tracker", "agent_profile_data"
+    And Target table is "agent_log"
+    And Only "purgo_playground.agent_log" is involved in the query
+    And The calculated field is "agent_key" (unique surrogate key)
+    And The following hardcoded values are required:
+      | agent_city | agent_state | agent_country | agent_zip_code |
+      | New York   | NY          | USA           | 10001          |
+    And The output must include:
+      | unix_id | agent_name | log_date | agent_first_login | agent_first_logout | total_login_time_hrs | agent_lunch_login | agent_lunch_logout | agent_lunch_duration | agent_city | agent_state | agent_country | agent_zip_code | data_loaded_at | agent_key |
+    And The "agent_key" must be a SHA256 hash of the concatenated values of all output fields except "agent_key" and "data_loaded_at"
+    And "data_loaded_at" must be the current timestamp
+
+  Scenario Outline: Successful Agent Log Calculated Field Generation (Happy Path)
+    Given session_tracking_data contains a record with person_identifier "<person_identifier>", session_start_time "<session_start_time>", session_end_time "<session_end_time>"
+    And user_presence_tracker contains a record with person_identifier "<person_identifier>", email_address "<email_address>"
+    And agent_profile_data contains a record with email_address "<email_address>", internal_user_key "<internal_user_key>", full_name "<full_name>", last_modified_timestamp "<last_modified_timestamp>"
+    When the query is executed
+    Then agent_log.unix_id must be populated with "<internal_user_key>"
+    And agent_log.agent_name must be populated with "<full_name>"
+    And agent_log.log_date must be populated with the date part of "<session_start_time>"
+    And agent_log.agent_first_login must be populated with the minimum "<session_start_time>" for the agent on that log_date
+    And agent_log.agent_first_logout must be populated with the maximum "<session_end_time>" for the agent on that log_date
+    And agent_log.total_login_time_hrs must be calculated as (agent_first_logout - agent_first_login) in hours, formatted as string with 2 decimal places
+    And agent_log.agent_city must be "New York"
+    And agent_log.agent_state must be "NY"
+    And agent_log.agent_country must be "USA"
+    And agent_log.agent_zip_code must be "10001"
+    And agent_log.data_loaded_at must be the current timestamp in ISO 8601 format
+    And agent_log.agent_key must be the SHA256 hash of the concatenated values of unix_id, agent_name, log_date, agent_first_login, agent_first_logout, total_login_time_hrs, agent_city, agent_state, agent_country, agent_zip_code
+
+    Examples:
+      | person_identifier | session_start_time      | session_end_time        | email_address         | internal_user_key | full_name      | last_modified_timestamp   |
+      | AGT001           | 2025-01-02T08:00:00Z    | 2025-01-02T17:00:00Z    | agent1@company.com    | IU001            | John Doe       | 2025-01-01T12:00:00Z      |
+      | AGT002           | 2025-01-03T09:15:00Z    | 2025-01-03T18:45:00Z    | agent2@company.com    | IU002            | Jane Smith     | 2025-01-02T09:00:00Z      |
+
+  Scenario Outline: Multiple agent_profile_data records for same email_address (Most Recent Selection)
+    Given agent_profile_data contains multiple records for email_address "<email_address>" with different last_modified_timestamp values
+    When the query is executed
+    Then agent_log.unix_id and agent_log.agent_name must be populated from the agent_profile_data record with the most recent last_modified_timestamp
+
+    Examples:
+      | email_address         | internal_user_key | full_name      | last_modified_timestamp   |
+      | agent1@company.com    | IU001            | John Doe       | 2025-01-01T12:00:00Z      |
+      | agent1@company.com    | IU001A           | John D.        | 2025-01-02T08:00:00Z      |
+
+  Scenario Outline: Missing person_identifier in session_tracking_data (Error Scenario)
+    Given session_tracking_data does not contain a record with person_identifier "<person_identifier>"
+    When the query is executed
+    Then no row must be generated in agent_log for person_identifier "<person_identifier>"
+
+    Examples:
+      | person_identifier |
+      | AGT999           |
+
+  Scenario Outline: Missing email_address in user_presence_tracker (Error Scenario)
+    Given user_presence_tracker does not contain a record with person_identifier "<person_identifier>"
+    When the query is executed
+    Then agent_log.unix_id and agent_log.agent_name must be NULL for person_identifier "<person_identifier>"
+    And agent_log.agent_key must be generated using NULL values for unix_id and agent_name
+
+    Examples:
+      | person_identifier | session_start_time      | session_end_time        |
+      | AGT003           | 2025-01-04T08:00:00Z    | 2025-01-04T17:00:00Z    |
+
+  Scenario Outline: Missing agent_profile_data for email_address (Error Scenario)
+    Given agent_profile_data does not contain a record with email_address "<email_address>"
+    When the query is executed
+    Then agent_log.unix_id and agent_log.agent_name must be NULL for email_address "<email_address>"
+    And agent_log.agent_key must be generated using NULL values for unix_id and agent_name
+
+    Examples:
+      | email_address         | person_identifier | session_start_time      | session_end_time        |
+      | missing@company.com   | AGT004           | 2025-01-05T08:00:00Z    | 2025-01-05T17:00:00Z    |
+
+  Scenario Outline: Multiple session_start_time/session_end_time records for same agent and log_date
+    Given session_tracking_data contains multiple records for person_identifier "<person_identifier>" on log_date "<log_date>"
+    When the query is executed
+    Then agent_log.agent_first_login must be the minimum session_start_time for that agent and log_date
+    And agent_log.agent_first_logout must be the maximum session_end_time for that agent and log_date
+    And agent_log.total_login_time_hrs must be calculated as (agent_first_logout - agent_first_login) in hours, formatted as string with 2 decimal places
+
+    Examples:
+      | person_identifier | log_date    | session_start_time_1   | session_end_time_1     | session_start_time_2   | session_end_time_2     |
+      | AGT005           | 2025-01-06  | 2025-01-06T07:55:00Z   | 2025-01-06T12:00:00Z   | 2025-01-06T13:00:00Z   | 2025-01-06T18:00:00Z   |
+
+  Scenario Outline: Missing session_end_time (Error Scenario)
+    Given session_tracking_data contains a record with person_identifier "<person_identifier>" and session_start_time "<session_start_time>" but session_end_time is NULL
+    When the query is executed
+    Then agent_log.agent_first_logout must be NULL
+    And agent_log.total_login_time_hrs must be NULL
+
+    Examples:
+      | person_identifier | session_start_time      |
+      | AGT006           | 2025-01-07T08:00:00Z    |
+
+  Scenario Outline: Unique Key Generation Validation
+    Given all required fields are populated for agent_log row
+    When the query is executed
+    Then agent_log.agent_key must be the SHA256 hash of the concatenated string:
+      "<unix_id>|<agent_name>|<log_date>|<agent_first_login>|<agent_first_logout>|<total_login_time_hrs>|New York|NY|USA|10001"
+    And the hash must be in lowercase hexadecimal format
+
+    Examples:
+      | unix_id | agent_name | log_date    | agent_first_login      | agent_first_logout      | total_login_time_hrs |
+      | IU007   | Alice Lee  | 2025-01-08  | 2025-01-08T08:00:00Z  | 2025-01-08T17:00:00Z   | 9.00                |
+
+  Scenario Outline: Data Validation - Field Formats
+    Given agent_log row is generated
+    Then agent_log.log_date must be in "YYYY-MM-DD" format
+    And agent_log.agent_first_login and agent_log.agent_first_logout must be in "YYYY-MM-DDTHH:MM:SSZ" ISO 8601 format
+    And agent_log.total_login_time_hrs must be a string with 2 decimal places
+
+    Examples:
+      | log_date    | agent_first_login      | agent_first_logout      | total_login_time_hrs |
+      | 2025-01-09  | 2025-01-09T08:00:00Z  | 2025-01-09T17:00:00Z   | 9.00                |
+
+  Scenario Outline: Data Validation - Hardcoded Location Fields
+    Given agent_log row is generated
+    Then agent_log.agent_city must be "New York"
+    And agent_log.agent_state must be "NY"
+    And agent_log.agent_country must be "USA"
+    And agent_log.agent_zip_code must be "10001"
+
+    Examples:
+      | agent_city | agent_state | agent_country | agent_zip_code |
+      | New York   | NY          | USA           | 10001          |
+
+  Scenario Outline: Data Validation - data_loaded_at Timestamp
+    Given agent_log row is generated
+    Then agent_log.data_loaded_at must be the current timestamp in "YYYY-MM-DDTHH:MM:SSZ" ISO 8601 format
+
+    Examples:
+      | data_loaded_at           |
+      | 2025-01-10T12:34:56Z     |
+
+  Scenario Outline: Error Handling - Ambiguous person_identifier (Multiple Matches)
+    Given session_tracking_data contains multiple records with the same person_identifier "<person_identifier>" and different session_start_time/session_end_time values
+    And user_presence_tracker contains multiple records with the same person_identifier "<person_identifier>" and different email_address values
+    When the query is executed
+    Then the query must select the most recent agent_profile_data record based on last_modified_timestamp for the resolved email_address
+    And agent_log row must be generated for each unique log_date
+
+    Examples:
+      | person_identifier | email_address_1      | email_address_2      | last_modified_timestamp_1 | last_modified_timestamp_2 |
+      | AGT008           | agent8@company.com   | agent8b@company.com  | 2025-01-10T10:00:00Z      | 2025-01-10T11:00:00Z      |
+
+  Scenario Outline: Error Handling - All Required Fields Missing
+    Given session_tracking_data, user_presence_tracker, and agent_profile_data do not contain any matching records for person_identifier "<person_identifier>"
+    When the query is executed
+    Then no row must be generated in agent_log for person_identifier "<person_identifier>"
+
+    Examples:
+      | person_identifier |
+      | AGT999           |
